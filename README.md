@@ -89,6 +89,22 @@ From a source checkout without installing:
 python run_editor.py
 ```
 
+### Large-file refresh diagnostics
+
+The RENO regression fixture can be parsed and measured without a display:
+
+```bash
+python tools/profile_reno.py
+```
+
+On Windows, run `python tools/profile_reno.py --tk`, scroll immediately while
+the status says **Analyzing…**, then edit a value before analysis completes and
+confirm that the later result does not replace the edit.  The console records
+file decoding, text insertion, parsing, geometry, reference graph, outline,
+geometry summary, viewport highlighting, diagnostics, and visible line-number
+timings.  For diagnostic comparison with highlighting entirely bypassed, use
+`python tools/profile_reno.py --tk --disable-highlighting`.
+
 After the editable install above, run the standard-library tests with:
 
 ```bash

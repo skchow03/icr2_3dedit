@@ -129,6 +129,25 @@ def _nest(tokens: tuple[Token, ...], issues: list[ParseIssue]) -> tuple[tuple[To
     return tuple(roots), maximum
 
 
+def _validate_nesting(tokens: tuple[Token, ...], issues: list[ParseIssue]) -> int:
+    """Validate the global token stream without retaining a duplicate syntax tree."""
+    groups: list[Token] = []
+    maximum = 0
+    for token in tokens:
+        if token.kind is TokenKind.OPEN:
+            groups.append(token)
+            maximum = max(maximum, sum(item.text != "<" for item in groups))
+        elif token.kind is TokenKind.CLOSE and groups and OPEN_TO_CLOSE[groups[-1].text] == token.text:
+            groups.pop()
+        elif token.kind is TokenKind.CLOSE and token.text != ">" and len(issues) < MAX_PARSE_ISSUES:
+            issues.append(ParseIssue("unmatched-close", f"Unmatched closing delimiter {token.text!r}", token.start, token.end, token.line))
+    for opener in groups:
+        if len(issues) >= MAX_PARSE_ISSUES:
+            break
+        issues.append(ParseIssue("unclosed-delimiter", f"Unclosed delimiter {opener.text!r}", opener.start, opener.end, opener.line))
+    return maximum
+
+
 def _statement_ranges(tokens: tuple[Token, ...], body_start: int, source_length: int) -> list[tuple[int, int, bool]]:
     ranges: list[tuple[int, int, bool]] = []
     start, stack = body_start, []
@@ -188,7 +207,7 @@ def parse_document(source: str) -> ParsedDocument:
                 (len(token.text) == 1 or token.text[-1] != token.text[0])):
             issues.append(ParseIssue("unterminated-quote", "Unterminated quoted string",
                                      token.start, token.end, token.line))
-    syntax, maximum = _nest(tokens, issues)
+    maximum = _validate_nesting(tokens, issues)
     header_end = _header_end(source, tokens)
     header = None
     if header_end is None:
