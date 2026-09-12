@@ -11,7 +11,23 @@ from .analysis import analyze
 from .document import SourceDocument
 from .parser import ParsedDocument, Statement, parse_document
 from .semantics import build_reference_graph
+from .geometry import GeometryModel, VertexDefinition, build_geometry_model
 from .syntax import COMMANDS
+
+
+OUTLINE_KINDS = ("All", "Vertex", "POLY", "LIST", "BSPF", "DYNAMIC", "SUPEROBJ", "Other")
+
+
+def statement_matches_filter(statement: Statement, name_filter: str, kind_filter: str) -> bool:
+    """Display-only outline predicate; it never changes the parsed model."""
+    if statement.name is None or name_filter.casefold() not in statement.name.casefold():
+        return False
+    normalized = "Vertex" if statement.kind == "vertex" else statement.kind.upper()
+    if kind_filter == "All":
+        return True
+    if kind_filter == "Other":
+        return normalized not in OUTLINE_KINDS[1:-1]
+    return normalized == kind_filter
 
 
 class EditorWindow(tk.Tk):
@@ -22,6 +38,8 @@ class EditorWindow(tk.Tk):
         self.minsize(850, 520)
         self.document = SourceDocument("")
         self.parsed = parse_document("")
+        self.geometry_model = build_geometry_model(self.parsed)
+        self.reference_graph = build_reference_graph(self.parsed)
         self._refresh_job: str | None = None
         self._statement_by_item: dict[str, Statement] = {}
         self._diagnostic_by_item: dict[str, object] = {}
@@ -82,14 +100,28 @@ class EditorWindow(tk.Tk):
         outer.add(right, weight=2)
 
         ttk.Label(left, text="Document outline").pack(anchor=tk.W)
-        self.outline = ttk.Treeview(left, columns=("kind", "line"), show="tree headings")
+        filters = ttk.Frame(left)
+        filters.pack(fill=tk.X, pady=(2, 4))
+        self.outline_filter = tk.StringVar()
+        filter_entry = ttk.Entry(filters, textvariable=self.outline_filter)
+        filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.outline_kind = tk.StringVar(value="All")
+        ttk.Combobox(filters, textvariable=self.outline_kind, values=OUTLINE_KINDS, state="readonly", width=10).pack(side=tk.LEFT, padx=(4, 0))
+        self.outline_filter.trace_add("write", lambda *_args: self._populate_outline())
+        self.outline_kind.trace_add("write", lambda *_args: self._populate_outline())
+        outline_frame = ttk.Frame(left)
+        outline_frame.pack(fill=tk.BOTH, expand=True)
+        self.outline = ttk.Treeview(outline_frame, columns=("kind", "line"), show="tree headings")
         self.outline.heading("#0", text="Name")
         self.outline.heading("kind", text="Kind")
         self.outline.heading("line", text="Line")
         self.outline.column("#0", width=150)
         self.outline.column("kind", width=75, stretch=False)
         self.outline.column("line", width=45, stretch=False)
-        self.outline.pack(fill=tk.BOTH, expand=True)
+        outline_scroll = ttk.Scrollbar(outline_frame, orient=tk.VERTICAL, command=self.outline.yview)
+        self.outline.configure(yscrollcommand=outline_scroll.set)
+        self.outline.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        outline_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.outline.bind("<<TreeviewSelect>>", self._outline_selected)
 
         ttk.Label(center, text="Source").pack(anchor=tk.W)
@@ -129,8 +161,10 @@ class EditorWindow(tk.Tk):
         notebook.pack(fill=tk.BOTH, expand=True)
         inspector_tab = ttk.Frame(notebook, padding=6)
         diagnostics_tab = ttk.Frame(notebook, padding=6)
+        geometry_tab = ttk.Frame(notebook, padding=6)
         notebook.add(inspector_tab, text="Inspector")
         notebook.add(diagnostics_tab, text="Diagnostics")
+        notebook.add(geometry_tab, text="Geometry")
 
         self.inspector = tk.Text(inspector_tab, wrap=tk.WORD, state=tk.DISABLED, width=32)
         self.inspector.pack(fill=tk.BOTH, expand=True)
@@ -146,6 +180,8 @@ class EditorWindow(tk.Tk):
         self.diagnostics.column("line", width=45, stretch=False)
         self.diagnostics.pack(fill=tk.BOTH, expand=True)
         self.diagnostics.bind("<Double-1>", self._diagnostic_selected)
+        self.geometry_summary = ttk.Label(geometry_tab, anchor=tk.NW, justify=tk.LEFT)
+        self.geometry_summary.pack(fill=tk.BOTH, expand=True)
 
         self.status = ttk.Label(self, text="Ready", anchor=tk.W, relief=tk.SUNKEN)
         self.status.pack(fill=tk.X, side=tk.BOTTOM)
@@ -212,7 +248,10 @@ class EditorWindow(tk.Tk):
         text = self.editor.get("1.0", "end-1c")
         self.document.text = text
         self.parsed = parse_document(text)
+        self.geometry_model = build_geometry_model(self.parsed)
+        self.reference_graph = build_reference_graph(self.parsed)
         self._populate_outline()
+        self._show_geometry_summary()
         self._highlight_source()
         self.refresh_analysis()
         self.status.configure(text=f"{len(self.parsed.definitions)} definitions, {len(self.parsed.statements)} statements")
@@ -223,7 +262,7 @@ class EditorWindow(tk.Tk):
         self.outline.delete(*self.outline.get_children())
         self._statement_by_item.clear()
         for statement in self.parsed.statements:
-            if statement.name is None:
+            if not statement_matches_filter(statement, self.outline_filter.get(), self.outline_kind.get()):
                 continue
             item = self.outline.insert(
                 "", tk.END,
@@ -254,7 +293,7 @@ class EditorWindow(tk.Tk):
     def refresh_analysis(self) -> None:
         self.diagnostics.delete(*self.diagnostics.get_children())
         self._diagnostic_by_item.clear()
-        for diagnostic in analyze(self.parsed):
+        for diagnostic in analyze(self.parsed, self.geometry_model):
             item = self.diagnostics.insert(
                 "", tk.END,
                 text=diagnostic.message,
@@ -298,6 +337,10 @@ class EditorWindow(tk.Tk):
         self._show_inspector(statement)
 
     def _show_inspector(self, statement: Statement) -> None:
+        vertex = self.geometry_model.vertices.get(statement.name or "")
+        if vertex is not None:
+            self._show_vertex_inspector(vertex)
+            return
         lines = [
             f"Name: {statement.name or '(none)'}",
             f"Kind: {statement.kind}",
@@ -305,7 +348,7 @@ class EditorWindow(tk.Tk):
             "",
             "References:",
         ]
-        graph = build_reference_graph(self.parsed)
+        graph = self.reference_graph
         if statement.name == graph.entry_point:
             lines.extend(("", f"Entry point: {graph.entry_point}" + (" (inferred)" if graph.inferred_entry_point else " (explicit)")))
         lines.extend(f"  {name}" for name in statement.references)
@@ -321,6 +364,50 @@ class EditorWindow(tk.Tk):
         self.inspector.delete("1.0", tk.END)
         self.inspector.insert("1.0", "\n".join(lines))
         self.inspector.configure(state=tk.DISABLED)
+
+    def _show_vertex_inspector(self, vertex: VertexDefinition) -> None:
+        def coordinate(axis: str, value: float, raw: str) -> str:
+            formatted = format(value, "g")
+            suffix = f" (original: {raw})" if raw != formatted else ""
+            return f"{axis}: {formatted}{suffix}"
+
+        users = self.parsed.references_to(vertex.name)
+        user_names = [item.name or f"statement on line {item.line}" for item in users]
+        coincident = self.geometry_model.coincident_names(vertex)
+        lines = [
+            f"Name: {vertex.name}", "Kind: Vertex", f"Line: {vertex.statement.line}", "",
+            coordinate("X", vertex.x, vertex.raw_x),
+            coordinate("Y", vertex.y, vertex.raw_y),
+            coordinate("Z", vertex.z, vertex.raw_z),
+            f"Distance from origin: {vertex.distance_from_origin:g} source units", "",
+            f"Referenced by: {len(users)}",
+            *(f"  {name}" for name in user_names),
+            "", "Identical coordinates:",
+            *(f"  {name}" for name in coincident),
+        ]
+        if not coincident:
+            lines.append("  (none)")
+        lines.extend(("", f"Reachable from root: {'Yes' if vertex.name in self.reference_graph.reachable else 'No'}"))
+        self.inspector.configure(state=tk.NORMAL)
+        self.inspector.delete("1.0", tk.END)
+        self.inspector.insert("1.0", "\n".join(lines))
+        self.inspector.configure(state=tk.DISABLED)
+
+    def _show_geometry_summary(self) -> None:
+        bounds = self.geometry_model.bounds
+        if bounds is None:
+            text = "No valid vertices found.\n\nBounds are unavailable."
+        else:
+            cx, cy, cz = bounds.center
+            text = (
+                f"Vertices: {len(self.geometry_model.vertices)}\n\n"
+                f"X: min {bounds.min_x:g}  max {bounds.max_x:g}  size {bounds.size_x:g}\n"
+                f"Y: min {bounds.min_y:g}  max {bounds.max_y:g}  size {bounds.size_y:g}\n"
+                f"Z: min {bounds.min_z:g}  max {bounds.max_z:g}  size {bounds.size_z:g}\n\n"
+                "Bounding-box center (source units):\n"
+                f"X {cx:g}\nY {cy:g}\nZ {cz:g}"
+            )
+        self.geometry_summary.configure(text=text)
 
     def _offset_index(self, offset: int) -> str:
         return f"1.0+{offset}c"

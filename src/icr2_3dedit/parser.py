@@ -36,6 +36,8 @@ class Statement:
     name_start: int | None = None
     name_end: int | None = None
     rhs: str | None = None
+    rhs_start: int | None = None
+    rhs_end: int | None = None
     kind: str = "statement"
     references: tuple[str, ...] = ()
     reference_tokens: tuple[IdentifierToken, ...] = ()
@@ -146,9 +148,11 @@ def parse_document(source: str) -> ParsedDocument:
             statement.name_start = start + definition.start(1)
             statement.name_end = start + definition.end(1)
             statement.rhs = definition.group(2)
+            statement.rhs_start = start + definition.start(2)
+            statement.rhs_end = start + definition.end(2)
             statement.kind = _infer_kind(statement.rhs)
             statement.line = _line(source, statement.name_start)
-            rhs_start = start + definition.start(2)
+            rhs_start = statement.rhs_start
             tokens = tuple(t for t in identifier_tokens(statement.rhs, rhs_start) if t.name != statement.name)
             statement.reference_tokens = tokens
             if statement.name in definitions:

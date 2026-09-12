@@ -29,6 +29,7 @@ def choose_entry_point(document: ParsedDocument) -> tuple[str | None, bool]:
 def build_reference_graph(document: ParsedDocument) -> ReferenceGraph:
     entry, inferred = choose_entry_point(document)
     reachable: set[str] = set()
+    visited: set[str] = set()
     active: list[str] = []
     cycles: list[tuple[str, ...]] = []
 
@@ -38,9 +39,9 @@ def build_reference_graph(document: ParsedDocument) -> ReferenceGraph:
             if cycle not in cycles:
                 cycles.append(cycle)
             return
-        if name in reachable:
+        if name in visited:
             return
-        reachable.add(name)
+        visited.add(name)
         active.append(name)
         for target in document.definitions[name].references:
             if target in document.definitions:
@@ -49,6 +50,10 @@ def build_reference_graph(document: ParsedDocument) -> ReferenceGraph:
 
     if entry is not None:
         visit(entry)
+        reachable.update(visited)
+    # Cycles are a whole-document property, independent of entry reachability.
+    for name in document.definitions:
+        visit(name)
     return ReferenceGraph(
         entry, inferred, frozenset(reachable),
         frozenset(document.definitions) - reachable, tuple(cycles),

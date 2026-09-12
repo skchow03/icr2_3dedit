@@ -11,8 +11,14 @@ editor with navigation and analysis rather than a general-purpose CAD program.
 - Dirty-state indication and Save/Discard/Cancel protection for New, Open, Exit,
   and window close
 - Statement outline with definition names and inferred kinds
+- Case-insensitive outline name filtering, kind filtering, and scrolling
 - Definition/reference navigation
-- Inspector showing a statement's source location and relationships
+- Typed, read-only vertex parsing with exact coordinate source spans and original
+  numeric spelling retained
+- Geometry summary with vertex count, axis-aligned bounds, extents, and bounding-box
+  center, all explicitly described in **source units**
+- Vertex inspector with coordinates, origin distance, references, reachability, and
+  coincident-vertex information
 - Diagnostics for headers, statement/quote termination, duplicate definitions,
   unknown commands, unresolved references, unreachable definitions, and cycles
 - Root-based reference-graph analysis (or an explicitly displayed inferred root)
@@ -25,7 +31,26 @@ authority and records source ranges instead of regenerating the document.
 Percent comments are recognized only when `%` is the first non-whitespace
 character on a line. Command recognition is centralized, but command argument
 shapes remain intentionally untyped because the complete Papyrus grammar has
-not yet been established.
+not yet been established. Vertex coordinates support signed integers, decimals,
+leading decimals (such as `.5` and `-.5`), and scientific notation for editor
+analysis. Scientific notation's acceptance by the Papyrus compiler has not been
+verified.
+
+The typed geometry layer understands the Wasp/roadcar-style optional texture
+suffix after a vertex position (for example, `, T=<u, v>`), while treating only
+the first `<x, y, z>` tuple as position. Values are not assigned an assumed
+physical unit: the interface calls them source units until conversion behavior
+is explicitly configured.
+
+## Known limitations
+
+- Polygon (`POLY`) arguments and geometry are not typed or editable yet.
+- Coordinate modification and structured geometry editing are not implemented.
+- There is no graphical model preview or OpenGL integration.
+- Scientific notation is accepted for analysis only; compiler compatibility is
+  an open grammar question.
+- Optional vertex metadata beyond the observed texture-coordinate suffix remains
+  conservatively preserved but untyped.
 
 ## Keyboard shortcuts
 
@@ -64,8 +89,9 @@ python -m pytest
 
 ## Next milestones
 
-1. Add typed vertex and polygon argument parsing on top of the existing exact
-   token spans, then calculate bounds, centers, normals, and winding.
-2. Add safe structured operations such as rename, reverse winding, and translate.
-3. Add a selectable 3D preview linked bidirectionally to the source editor.
-4. Model Papyrus list and BSP nodes explicitly and visualize their traversal.
+1. Add typed, span-preserving `POLY` parsing that resolves vertex references but
+   still leaves source text authoritative.
+2. Add polygon-derived calculations only after winding and argument grammar are
+   verified against user-authored fixtures.
+3. Add safe structured operations such as rename, reverse winding, and translate.
+4. Add a selectable 3D preview linked bidirectionally to the source editor.

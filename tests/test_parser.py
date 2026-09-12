@@ -115,6 +115,13 @@ class ParserTests(unittest.TestCase):
         messages = [item.message for item in analyze(parse_document(source))]
         self.assertTrue(any("Reference cycle" in message for message in messages))
 
+    def test_unreachable_cycle_is_reported_separately_from_reachability(self) -> None:
+        source = "3D VERSION 3.0;\na: LIST {b};\nb: LIST {a};\nroot: LIST {NIL};\n"
+        messages = [item.message for item in analyze(parse_document(source))]
+        self.assertTrue(any("Reference cycle" in message for message in messages))
+        self.assertIn("Definition is unreachable: a", messages)
+        self.assertIn("Definition is unreachable: b", messages)
+
 
 if __name__ == "__main__":
     unittest.main()
