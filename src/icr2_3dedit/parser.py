@@ -12,7 +12,7 @@ import re
 
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-LEADING_TRIVIA = r"(?:(?:\s+)|(?://[^\r\n]*(?:\r?\n|$))|(?:/\*.*?\*/))*"
+LEADING_TRIVIA = r"(?:(?:\s+)|(?:[ \t]*%[^\r\n]*(?:\r?\n|$)))*"
 DEFINITION_RE = re.compile(
     rf"^{LEADING_TRIVIA}({IDENTIFIER})\s*:\s*(.*?)\s*;\s*$",
     re.DOTALL,
@@ -44,6 +44,7 @@ class ParsedDocument:
     statements: list[Statement]
     definitions: dict[str, Statement]
     duplicates: dict[str, list[Statement]] = field(default_factory=dict)
+    inline_comment_lines: tuple[int, ...] = ()
 
     def statement_at(self, offset: int) -> Statement | None:
         for statement in self.statements:
@@ -63,23 +64,14 @@ def _split_statements(source: str) -> list[tuple[int, int]]:
     index = 0
     quote: str | None = None
     line_comment = False
-    block_comment = False
 
     while index < len(source):
         char = source[index]
-        following = source[index + 1] if index + 1 < len(source) else ""
 
         if line_comment:
             if char in "\r\n":
                 line_comment = False
             index += 1
-            continue
-        if block_comment:
-            if char == "*" and following == "/":
-                block_comment = False
-                index += 2
-            else:
-                index += 1
             continue
         if quote:
             if char == "\\":
@@ -89,13 +81,10 @@ def _split_statements(source: str) -> list[tuple[int, int]]:
                 quote = None
             index += 1
             continue
-        if char == "/" and following == "/":
+        line_start = source.rfind("\n", 0, index) + 1
+        if char == "%" and not source[line_start:index].strip():
             line_comment = True
-            index += 2
-            continue
-        if char == "/" and following == "*":
-            block_comment = True
-            index += 2
+            index += 1
             continue
         if char in "\"'":
             quote = char
@@ -129,6 +118,12 @@ def parse_document(source: str) -> ParsedDocument:
     definitions: dict[str, Statement] = {}
     duplicates: dict[str, list[Statement]] = {}
 
+    inline_comment_lines = tuple(
+        line_number
+        for line_number, line in enumerate(source.splitlines(), start=1)
+        if "%" in line and not line.lstrip().startswith("%")
+    )
+
     for start, end in _split_statements(source):
         text = source[start:end]
         definition = DEFINITION_RE.match(text)
@@ -157,7 +152,9 @@ def parse_document(source: str) -> ParsedDocument:
             )
         )
 
-    return ParsedDocument(source, statements, definitions, duplicates)
+    return ParsedDocument(
+        source, statements, definitions, duplicates, inline_comment_lines
+    )
 
 
 def identifier_candidates(rhs: str) -> tuple[str, ...]:

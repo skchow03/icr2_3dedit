@@ -11,7 +11,9 @@ editor with navigation and analysis rather than a general-purpose CAD program.
 - Definition/reference navigation
 - Inspector showing a statement's source location and relationships
 - Diagnostics for duplicate definitions, unresolved references, and unused items
-- Syntax highlighting for definitions, commands, numbers, and comments
+- Source line numbers and syntax highlighting for definitions, commands, numbers,
+  and full-line `%` comments
+- Error diagnostics when `%` is used as an inline comment (unsupported by `.3D`)
 
 The parser is deliberately conservative. It keeps the original source as the
 authority and records source ranges instead of regenerating the document.
