@@ -1,0 +1,7 @@
+3D VERSION 3.0;
+integer_vertex: [<1, -2, 3>];
+decimal_vertex: [<1.25, -2.5, 3.0>];
+leading_decimal_vertex: [<.5,
+  -.25, +.75>];
+textured_vertex: [<10, 20, 30>, T=<4, 5>];
+root: LIST {integer_vertex, decimal_vertex, leading_decimal_vertex, textured_vertex};

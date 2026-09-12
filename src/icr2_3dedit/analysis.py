@@ -7,6 +7,7 @@ from enum import Enum
 
 from .parser import ParsedDocument, Statement
 from .semantics import build_reference_graph
+from .geometry import GeometryModel, build_geometry_model
 
 
 class Severity(str, Enum):
@@ -25,7 +26,7 @@ class Diagnostic:
     end: int | None = None
 
 
-def analyze(document: ParsedDocument) -> list[Diagnostic]:
+def analyze(document: ParsedDocument, geometry: GeometryModel | None = None) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for issue in document.issues:
         diagnostics.append(Diagnostic(Severity.WARNING if issue.warning else Severity.ERROR, issue.message, issue.line, document.statement_at(issue.start), issue.start, issue.end))
@@ -35,6 +36,10 @@ def analyze(document: ParsedDocument) -> list[Diagnostic]:
     for name, statements in document.duplicates.items():
         for statement in statements[1:]:
             diagnostics.append(Diagnostic(Severity.ERROR, f"Duplicate definition: {name}", statement.line, statement, statement.name_start, statement.name_end))
+    geometry = geometry or build_geometry_model(document)
+    for issue in geometry.issues:
+        severity = Severity.INFO if issue.code == "duplicate-coordinate" else Severity.ERROR
+        diagnostics.append(Diagnostic(severity, issue.message, _token_line(document.source, issue.span.start), issue.statement, issue.span.start, issue.span.end))
     known = set(document.definitions)
     for statement in document.statements:
         for token in statement.reference_tokens:
