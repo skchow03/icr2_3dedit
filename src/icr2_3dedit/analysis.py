@@ -25,6 +25,13 @@ class Diagnostic:
 def analyze(document: ParsedDocument) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
 
+    for line in document.inline_comment_lines:
+        diagnostics.append(Diagnostic(
+            Severity.ERROR,
+            "Inline comments are not allowed; comments must be on their own line",
+            line,
+        ))
+
     for name, statements in document.duplicates.items():
         for statement in statements[1:]:
             diagnostics.append(Diagnostic(
@@ -60,4 +67,3 @@ def analyze(document: ParsedDocument) -> list[Diagnostic]:
             ))
 
     return sorted(diagnostics, key=lambda item: (item.line, item.severity.value, item.message))
-

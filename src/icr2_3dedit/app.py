@@ -78,17 +78,28 @@ class EditorWindow(tk.Tk):
             font=("Consolas", 11),
             tabs=(32,),
         )
+        self.line_numbers = tk.Canvas(
+            editor_frame,
+            width=36,
+            highlightthickness=0,
+            background="#f2f2f2",
+        )
         vertical = ttk.Scrollbar(editor_frame, orient=tk.VERTICAL, command=self.editor.yview)
         horizontal = ttk.Scrollbar(editor_frame, orient=tk.HORIZONTAL, command=self.editor.xview)
-        self.editor.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.editor.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
+        self.editor.configure(
+            yscrollcommand=lambda first, last: self._editor_scrolled(vertical, first, last),
+            xscrollcommand=horizontal.set,
+        )
+        self.line_numbers.grid(row=0, column=0, sticky="ns")
+        self.editor.grid(row=0, column=1, sticky="nsew")
+        vertical.grid(row=0, column=2, sticky="ns")
+        horizontal.grid(row=1, column=1, sticky="ew")
         editor_frame.rowconfigure(0, weight=1)
-        editor_frame.columnconfigure(0, weight=1)
+        editor_frame.columnconfigure(1, weight=1)
         self.editor.bind("<<Modified>>", self._text_modified)
         self.editor.bind("<ButtonRelease-1>", self._cursor_changed)
         self.editor.bind("<KeyRelease>", self._cursor_changed)
+        self.editor.bind("<Configure>", self._redraw_line_numbers, add=True)
 
         notebook = ttk.Notebook(right)
         notebook.pack(fill=tk.BOTH, expand=True)
@@ -119,7 +130,7 @@ class EditorWindow(tk.Tk):
         self.editor.tag_configure("definition", foreground="#005a9c", font=("Consolas", 11, "bold"))
         self.editor.tag_configure("command", foreground="#7a3e9d")
         self.editor.tag_configure("number", foreground="#a04400")
-        self.editor.tag_configure("comment", foreground="#68866b")
+        self.editor.tag_configure("comment", foreground="#238636", font=("Consolas", 11, "italic"))
         self.editor.tag_configure("selected_statement", background="#fff4c2")
 
     def _set_text(self, text: str) -> None:
@@ -135,6 +146,40 @@ class EditorWindow(tk.Tk):
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
         self._refresh_job = self.after(250, self._refresh_model)
+        self._redraw_line_numbers()
+
+    def _editor_scrolled(
+        self,
+        scrollbar: ttk.Scrollbar,
+        first: str,
+        last: str,
+    ) -> None:
+        scrollbar.set(first, last)
+        self._redraw_line_numbers()
+
+    def _redraw_line_numbers(self, _event: tk.Event | None = None) -> None:
+        """Draw numbers beside each source line currently visible in the editor."""
+
+        self.line_numbers.delete("all")
+        index = self.editor.index("@0,0")
+        while True:
+            display = self.editor.dlineinfo(index)
+            if display is None:
+                break
+            y = display[1]
+            line = index.split(".", 1)[0]
+            self.line_numbers.create_text(
+                self.line_numbers.winfo_width() - 6,
+                y,
+                anchor="ne",
+                text=line,
+                fill="#666666",
+                font=("Consolas", 10),
+            )
+            index = self.editor.index(f"{index}+1line")
+
+        digits = max(2, len(self.editor.index("end-1c").split(".", 1)[0]))
+        self.line_numbers.configure(width=12 + digits * 8)
 
     def _refresh_model(self) -> None:
         self._refresh_job = None
@@ -166,7 +211,7 @@ class EditorWindow(tk.Tk):
             "definition": r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
             "command": r"\b(?:NIL|POLY|POLYGON|LIST|BSP|DYNAMIC|SUPEROBJ|SWITCH)\b",
             "number": r"(?<![A-Za-z_])[-+]?(?:\d+\.\d*|\.\d+|\d+)(?![A-Za-z_])",
-            "comment": r"//[^\r\n]*|/\*[\s\S]*?\*/",
+            "comment": r"(?m)^[ \t]*%[^\r\n]*",
         }
         source = self.document.text
         for tag, pattern in patterns.items():
@@ -287,4 +332,3 @@ class EditorWindow(tk.Tk):
 
 def main() -> None:
     EditorWindow().mainloop()
-

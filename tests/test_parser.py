@@ -38,11 +38,29 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(reconstructed, SOURCE)
 
     def test_comment_before_definition_is_preserved_and_parsed(self) -> None:
-        source = "// wheel hub\n/* retained */\nhub: [<0, 0, 0>];\n"
+        source = "% wheel hub\n  % retained\nhub: [<0, 0, 0>];\n"
         parsed = parse_document(source)
         self.assertIn("hub", parsed.definitions)
         self.assertEqual(parsed.definitions["hub"].line, 3)
         self.assertEqual("".join(item.text for item in parsed.statements), source)
+
+    def test_semicolon_in_comment_does_not_end_statement(self) -> None:
+        source = "% not a statement; still a comment\nhub: NIL;\n"
+        parsed = parse_document(source)
+        self.assertEqual(len(parsed.statements), 2)
+        self.assertIn("hub", parsed.definitions)
+
+    def test_inline_comment_is_an_error(self) -> None:
+        parsed = parse_document("hub: NIL; % invalid inline comment\n")
+        errors = [item for item in analyze(parsed) if item.severity is Severity.ERROR]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].line, 1)
+        self.assertIn("must be on their own line", errors[0].message)
+
+    def test_indented_comment_is_not_an_inline_comment(self) -> None:
+        parsed = parse_document("  % valid full-line comment\nhub: NIL;\n")
+        errors = [item for item in analyze(parsed) if item.severity is Severity.ERROR]
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
