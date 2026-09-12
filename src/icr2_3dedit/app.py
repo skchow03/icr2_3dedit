@@ -5,11 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .analysis import analyze
 from .document import SourceDocument
 from .parser import ParsedDocument, Statement, parse_document
+from .semantics import build_reference_graph
+from .syntax import COMMANDS
 
 
 class EditorWindow(tk.Tk):
@@ -22,29 +24,51 @@ class EditorWindow(tk.Tk):
         self.parsed = parse_document("")
         self._refresh_job: str | None = None
         self._statement_by_item: dict[str, Statement] = {}
+        self._diagnostic_by_item: dict[str, object] = {}
         self._build_menu()
         self._build_ui()
         self._configure_highlighting()
         self._set_text("3D VERSION 3.0;\n\nnil: NIL;\n")
+        self.document = SourceDocument(self.editor.get("1.0", "end-1c"))
+        self._update_title()
+        self.protocol("WM_DELETE_WINDOW", self.exit_editor)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
         file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="New", accelerator="Ctrl+N", command=self.new_file)
         file_menu.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_file)
         file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_file)
         file_menu.add_command(label="Save As…", accelerator="Ctrl+Shift+S", command=self.save_file_as)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.destroy)
+        file_menu.add_command(label="Exit", command=self.exit_editor)
         menu.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menu, tearoff=False)
+        edit_menu.add_command(label="Find…", accelerator="Ctrl+F", command=self.find_dialog)
+        edit_menu.add_command(label="Find Next", accelerator="F3", command=self.find_next)
+        edit_menu.add_command(label="Find Previous", accelerator="Shift+F3", command=lambda: self.find_next(backwards=True))
+        edit_menu.add_command(label="Go to Line…", accelerator="Ctrl+G", command=self.go_to_line)
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Go to Definition", accelerator="F12", command=self.go_to_definition)
+        edit_menu.add_command(label="List References", accelerator="Shift+F12", command=self.list_references)
+        menu.add_cascade(label="Edit", menu=edit_menu)
 
         tools_menu = tk.Menu(menu, tearoff=False)
         tools_menu.add_command(label="Analyze", accelerator="F7", command=self.refresh_analysis)
         menu.add_cascade(label="Tools", menu=tools_menu)
         self.config(menu=menu)
+        self.bind_all("<Control-n>", lambda _event: self.new_file())
         self.bind_all("<Control-o>", lambda _event: self.open_file())
         self.bind_all("<Control-s>", lambda _event: self.save_file())
         self.bind_all("<Control-Shift-S>", lambda _event: self.save_file_as())
         self.bind_all("<F7>", lambda _event: self.refresh_analysis())
+        self.bind_all("<Control-f>", lambda _event: self.find_dialog())
+        self.bind_all("<F3>", lambda _event: self.find_next())
+        self.bind_all("<Shift-F3>", lambda _event: self.find_next(backwards=True))
+        self.bind_all("<Control-g>", lambda _event: self.go_to_line())
+        self.bind_all("<F12>", lambda _event: self.go_to_definition())
+        self.bind_all("<Shift-F12>", lambda _event: self.list_references())
 
     def _build_ui(self) -> None:
         outer = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -143,6 +167,8 @@ class EditorWindow(tk.Tk):
         if not self.editor.edit_modified():
             return
         self.editor.edit_modified(False)
+        self.document.text = self.editor.get("1.0", "end-1c")
+        self._update_title()
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
         self._refresh_job = self.after(250, self._refresh_model)
@@ -192,6 +218,8 @@ class EditorWindow(tk.Tk):
         self.status.configure(text=f"{len(self.parsed.definitions)} definitions, {len(self.parsed.statements)} statements")
 
     def _populate_outline(self) -> None:
+        selected_names = [self._statement_by_item[item].name for item in self.outline.selection() if item in self._statement_by_item]
+        yview = self.outline.yview()
         self.outline.delete(*self.outline.get_children())
         self._statement_by_item.clear()
         for statement in self.parsed.statements:
@@ -203,13 +231,17 @@ class EditorWindow(tk.Tk):
                 values=(statement.kind, statement.line),
             )
             self._statement_by_item[item] = statement
+            if statement.name in selected_names:
+                self.outline.selection_add(item)
+        if yview:
+            self.outline.yview_moveto(yview[0])
 
     def _highlight_source(self) -> None:
         for tag in ("definition", "command", "number", "comment"):
             self.editor.tag_remove(tag, "1.0", tk.END)
         patterns = {
             "definition": r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
-            "command": r"\b(?:NIL|POLY|POLYGON|LIST|BSP|DYNAMIC|SUPEROBJ|SWITCH)\b",
+            "command": rf"\b(?:{'|'.join(sorted(COMMANDS))})\b",
             "number": r"(?<![A-Za-z_])[-+]?(?:\d+\.\d*|\.\d+|\d+)(?![A-Za-z_])",
             "comment": r"(?m)^[ \t]*%[^\r\n]*",
         }
@@ -221,13 +253,14 @@ class EditorWindow(tk.Tk):
 
     def refresh_analysis(self) -> None:
         self.diagnostics.delete(*self.diagnostics.get_children())
+        self._diagnostic_by_item.clear()
         for diagnostic in analyze(self.parsed):
-            self.diagnostics.insert(
+            item = self.diagnostics.insert(
                 "", tk.END,
                 text=diagnostic.message,
                 values=(diagnostic.severity.value, diagnostic.line),
-                tags=(str(diagnostic.line),),
             )
+            self._diagnostic_by_item[item] = diagnostic
 
     def _outline_selected(self, _event: tk.Event) -> None:
         selected = self.outline.selection()
@@ -240,10 +273,11 @@ class EditorWindow(tk.Tk):
         selected = self.diagnostics.selection()
         if not selected:
             return
-        values = self.diagnostics.item(selected[0], "values")
-        if values:
-            self.editor.mark_set(tk.INSERT, f"{values[1]}.0")
-            self.editor.see(tk.INSERT)
+        diagnostic = self._diagnostic_by_item.get(selected[0])
+        if diagnostic is not None:
+            start = diagnostic.start if diagnostic.start is not None else self._line_offset(diagnostic.line)
+            end = diagnostic.end if diagnostic.end is not None else start
+            self._select_range(start, end)
 
     def _cursor_changed(self, _event: tk.Event) -> None:
         try:
@@ -271,6 +305,9 @@ class EditorWindow(tk.Tk):
             "",
             "References:",
         ]
+        graph = build_reference_graph(self.parsed)
+        if statement.name == graph.entry_point:
+            lines.extend(("", f"Entry point: {graph.entry_point}" + (" (inferred)" if graph.inferred_entry_point else " (explicit)")))
         lines.extend(f"  {name}" for name in statement.references)
         if not statement.references:
             lines.append("  (none resolved)")
@@ -288,7 +325,29 @@ class EditorWindow(tk.Tk):
     def _offset_index(self, offset: int) -> str:
         return f"1.0+{offset}c"
 
+    def _update_title(self) -> None:
+        name = self.document.path.name if self.document.path else "Untitled"
+        self.title(f"ICR2 3D Editor — {name}{'*' if self.document.dirty else ''}")
+
+    def _confirm_discard(self) -> bool:
+        self.document.text = self.editor.get("1.0", "end-1c")
+        if not self.document.dirty:
+            return True
+        choice = messagebox.askyesnocancel("Unsaved changes", "Save changes before continuing?")
+        if choice is None:
+            return False
+        return self.save_file() if choice else True
+
+    def new_file(self) -> None:
+        if not self._confirm_discard():
+            return
+        self.document = SourceDocument("3D VERSION 3.0;\n\n")
+        self._set_text(self.document.text)
+        self._update_title()
+
     def open_file(self) -> None:
+        if not self._confirm_discard():
+            return
         filename = filedialog.askopenfilename(
             title="Open Papyrus .3D file",
             filetypes=(("Papyrus 3D source", "*.3d *.3D"), ("All files", "*.*")),
@@ -298,36 +357,105 @@ class EditorWindow(tk.Tk):
         try:
             self.document = SourceDocument.load(filename)
             self._set_text(self.document.text)
-            self.title(f"ICR2 3D Editor — {Path(filename).name}")
+            self._update_title()
         except OSError as error:
             messagebox.showerror("Open failed", str(error))
 
-    def save_file(self) -> None:
+    def save_file(self) -> bool:
         if self.document.path is None:
-            self.save_file_as()
-            return
+            return self.save_file_as()
         self.document.text = self.editor.get("1.0", "end-1c")
         try:
             self.document.save()
             self.status.configure(text=f"Saved {self.document.path}")
+            self._update_title()
+            return True
         except (OSError, UnicodeError) as error:
             messagebox.showerror("Save failed", str(error))
+            return False
 
-    def save_file_as(self) -> None:
+    def save_file_as(self) -> bool:
         filename = filedialog.asksaveasfilename(
             title="Save Papyrus .3D file",
             defaultextension=".3D",
             filetypes=(("Papyrus 3D source", "*.3d *.3D"), ("All files", "*.*")),
         )
         if not filename:
-            return
+            return False
         self.document.text = self.editor.get("1.0", "end-1c")
         try:
             self.document.save(filename)
-            self.title(f"ICR2 3D Editor — {Path(filename).name}")
+            self._update_title()
             self.status.configure(text=f"Saved {filename}")
+            return True
         except (OSError, UnicodeError) as error:
             messagebox.showerror("Save failed", str(error))
+            return False
+
+    def exit_editor(self) -> None:
+        if self._confirm_discard():
+            self.destroy()
+
+    def _line_offset(self, line: int) -> int:
+        lines = self.document.text.splitlines(keepends=True)
+        return sum(map(len, lines[:max(0, line - 1)]))
+
+    def _select_range(self, start: int, end: int) -> None:
+        first, last = self._offset_index(start), self._offset_index(max(start, end))
+        self.editor.tag_remove(tk.SEL, "1.0", tk.END)
+        if end > start:
+            self.editor.tag_add(tk.SEL, first, last)
+        self.editor.mark_set(tk.INSERT, first)
+        self.editor.see(first)
+        self.editor.focus_set()
+
+    def find_dialog(self) -> None:
+        query = simpledialog.askstring("Find", "Text to find:", parent=self)
+        if query:
+            self._find_query = query
+            self.find_next()
+
+    def find_next(self, backwards: bool = False) -> None:
+        query = getattr(self, "_find_query", "")
+        if not query:
+            self.find_dialog()
+            return
+        start = self.editor.index("insert-1c" if backwards else "insert+1c")
+        position = self.editor.search(query, start, stopindex="1.0" if backwards else tk.END, backwards=backwards, nocase=True)
+        if not position:
+            position = self.editor.search(query, tk.END if backwards else "1.0", stopindex="1.0" if backwards else tk.END, backwards=backwards, nocase=True)
+        if position:
+            offset = int(self.editor.count("1.0", position, "chars")[0])
+            self._select_range(offset, offset + len(query))
+
+    def go_to_line(self) -> None:
+        line = simpledialog.askinteger("Go to Line", "Line number:", parent=self, minvalue=1)
+        if line is not None:
+            self.editor.mark_set(tk.INSERT, f"{line}.0")
+            self.editor.see(tk.INSERT)
+
+    def _identifier_at_cursor(self) -> str | None:
+        if self.editor.tag_ranges(tk.SEL):
+            value = self.editor.get(tk.SEL_FIRST, tk.SEL_LAST)
+            return value if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) else None
+        return self.editor.get("insert wordstart", "insert wordend") or None
+
+    def go_to_definition(self) -> None:
+        statement = self.parsed.definitions.get(self._identifier_at_cursor() or "")
+        if statement is not None:
+            self._select_range(statement.name_start or statement.start, statement.name_end or statement.end)
+
+    def list_references(self) -> None:
+        name = self._identifier_at_cursor()
+        tokens = self.parsed.reference_tokens_to(name or "")
+        if not tokens:
+            messagebox.showinfo("References", f"No references to {name or 'selection'}.")
+            return
+        choices = "\n".join(f"{index + 1}: line {self.document.text.count(chr(10), 0, token.start) + 1}" for index, token in enumerate(tokens))
+        selected = simpledialog.askinteger("References", f"References to {name}:\n{choices}\n\nNavigate to number:", parent=self, minvalue=1, maxvalue=len(tokens))
+        if selected:
+            token = tokens[selected - 1]
+            self._select_range(token.start, token.end)
 
 
 def main() -> None:
