@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icr2-3dedit"
+version = "0.1.0"
+description = "A structure-aware text editor for Papyrus ICR2 .3D source files"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "ICR2 community"}]
+dependencies = []
+
+[project.scripts]
+icr2-3dedit = "icr2_3dedit.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
