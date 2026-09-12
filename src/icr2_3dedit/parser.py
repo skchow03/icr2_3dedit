@@ -1,29 +1,29 @@
-"""Conservative parsing for structure and navigation.
-
-This is not yet a complete Papyrus grammar. It divides the source into
-semicolon-terminated statements while preserving their exact source ranges,
-then recognizes definitions without rebuilding or normalizing the source.
-"""
+"""Conservative, source-range-preserving Papyrus structure parser."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
 
+from .syntax import COMMANDS, IDENTIFIER_PATTERN, IdentifierToken, command_at_start, identifier_tokens
 
-IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+
 LEADING_TRIVIA = r"(?:(?:\s+)|(?:[ \t]*%[^\r\n]*(?:\r?\n|$)))*"
 DEFINITION_RE = re.compile(
-    rf"^{LEADING_TRIVIA}({IDENTIFIER})\s*:\s*(.*?)\s*;\s*$",
-    re.DOTALL,
+    rf"^{LEADING_TRIVIA}({IDENTIFIER_PATTERN})\s*:\s*(.*?)\s*;\s*$", re.DOTALL
 )
-REFERENCE_RE = re.compile(rf"\b({IDENTIFIER})\b")
-COMMAND_RE = re.compile(rf"^\s*({IDENTIFIER})\b")
+DEFINITION_LIKE_RE = re.compile(rf"^{LEADING_TRIVIA}{IDENTIFIER_PATTERN}\s*:", re.DOTALL)
+HEADER_RE = re.compile(r"^\s*3D\s+VERSION\s+3\.0\s*;", re.IGNORECASE)
 
-RESERVED_WORDS = {
-    "and", "or", "not", "nil", "true", "false", "version",
-    "poly", "polygon", "list", "bsp", "dynamic", "superobj", "switch",
-}
+
+@dataclass(frozen=True, slots=True)
+class ParseIssue:
+    code: str
+    message: str
+    start: int
+    end: int
+    line: int
+    warning: bool = False
 
 
 @dataclass(slots=True)
@@ -33,9 +33,12 @@ class Statement:
     end: int
     line: int
     name: str | None = None
+    name_start: int | None = None
+    name_end: int | None = None
     rhs: str | None = None
     kind: str = "statement"
     references: tuple[str, ...] = ()
+    reference_tokens: tuple[IdentifierToken, ...] = ()
 
 
 @dataclass(slots=True)
@@ -45,62 +48,75 @@ class ParsedDocument:
     definitions: dict[str, Statement]
     duplicates: dict[str, list[Statement]] = field(default_factory=dict)
     inline_comment_lines: tuple[int, ...] = ()
+    issues: tuple[ParseIssue, ...] = ()
 
     def statement_at(self, offset: int) -> Statement | None:
-        for statement in self.statements:
-            if statement.start <= offset < statement.end:
-                return statement
-        return None
+        return next((s for s in self.statements if s.start <= offset < s.end), None)
 
     def references_to(self, name: str) -> list[Statement]:
         return [s for s in self.statements if name in s.references]
 
+    def reference_tokens_to(self, name: str) -> list[IdentifierToken]:
+        return [token for s in self.statements for token in s.reference_tokens if token.name == name]
 
-def _split_statements(source: str) -> list[tuple[int, int]]:
-    """Return source ranges ending at semicolons outside quotes/comments."""
 
-    ranges: list[tuple[int, int]] = []
-    start = 0
-    index = 0
+def _line(source: str, offset: int) -> int:
+    return source.count("\n", 0, offset) + 1
+
+
+def _scan(source: str) -> tuple[list[tuple[int, int, bool]], list[ParseIssue]]:
+    """Split at semicolons outside quotes/comments and report lexical endings."""
+    ranges: list[tuple[int, int, bool]] = []
+    issues: list[ParseIssue] = []
+    start = index = 0
     quote: str | None = None
-    line_comment = False
-
+    quote_start = 0
+    comment = False
+    line_nonspace = False
     while index < len(source):
         char = source[index]
-
-        if line_comment:
+        if comment:
             if char in "\r\n":
-                line_comment = False
+                comment = False
+                line_nonspace = False
             index += 1
             continue
         if quote:
-            if char == "\\":
+            if char == "\\" and index + 1 < len(source):
                 index += 2
                 continue
             if char == quote:
                 quote = None
             index += 1
             continue
-        line_start = source.rfind("\n", 0, index) + 1
-        if char == "%" and not source[line_start:index].strip():
-            line_comment = True
+        if char in "\r\n":
+            line_nonspace = False
             index += 1
             continue
+        if char in " \t" and not line_nonspace:
+            index += 1
+            continue
+        if char == "%" and not line_nonspace:
+            comment = True
+            index += 1
+            continue
+        line_nonspace = True
         if char in "\"'":
-            quote = char
-            index += 1
-            continue
-        if char == ";":
-            ranges.append((start, index + 1))
+            quote, quote_start = char, index
+        elif char == ";":
+            ranges.append((start, index + 1, True))
             start = index + 1
         index += 1
-
-    # Preserve trailing whitespace/comments as a trivia statement. This makes
-    # concatenating statement text reproduce the source byte-for-byte after
-    # decoding, including a final newline.
+    if quote:
+        issues.append(ParseIssue("unterminated-quote", "Unterminated quoted string", quote_start, len(source), _line(source, quote_start)))
     if start < len(source):
-        ranges.append((start, len(source)))
-    return ranges
+        ranges.append((start, len(source), False))
+        remainder = source[start:]
+        meaningful = [line for line in remainder.splitlines() if line.strip() and not line.lstrip().startswith("%")]
+        if meaningful:
+            pos = start + next((i for i, c in enumerate(remainder) if not c.isspace()), 0)
+            issues.append(ParseIssue("unterminated-statement", "Unterminated statement or missing semicolon", pos, len(source), _line(source, pos)))
+    return ranges, issues
 
 
 def _infer_kind(rhs: str) -> str:
@@ -109,58 +125,64 @@ def _infer_kind(rhs: str) -> str:
         return "NIL"
     if re.match(r"^\[\s*<", stripped):
         return "vertex"
-    command = COMMAND_RE.match(stripped)
-    return command.group(1).upper() if command else "value"
+    return command_at_start(stripped) or "value"
 
 
 def parse_document(source: str) -> ParsedDocument:
     statements: list[Statement] = []
     definitions: dict[str, Statement] = {}
     duplicates: dict[str, list[Statement]] = {}
+    ranges, issues = _scan(source)
+    if not HEADER_RE.match(source):
+        issues.append(ParseIssue("invalid-header", "Missing or invalid '3D VERSION 3.0;' header", 0, min(len(source), source.find("\n") if "\n" in source else len(source)), 1))
 
-    inline_comment_lines = tuple(
-        line_number
-        for line_number, line in enumerate(source.splitlines(), start=1)
-        if "%" in line and not line.lstrip().startswith("%")
-    )
-
-    for start, end in _split_statements(source):
+    inline_lines = tuple(i for i, line in enumerate(source.splitlines(), 1) if _has_inline_percent(line))
+    for start, end, terminated in ranges:
         text = source[start:end]
-        definition = DEFINITION_RE.match(text)
-        line = source.count("\n", 0, start) + 1
-        statement = Statement(text=text, start=start, end=end, line=line)
+        definition = DEFINITION_RE.match(text) if terminated else None
+        statement = Statement(text, start, end, _line(source, start))
         if definition:
             statement.name = definition.group(1)
+            statement.name_start = start + definition.start(1)
+            statement.name_end = start + definition.end(1)
             statement.rhs = definition.group(2)
             statement.kind = _infer_kind(statement.rhs)
-            statement.line += text.count("\n", 0, definition.start(1))
+            statement.line = _line(source, statement.name_start)
+            rhs_start = start + definition.start(2)
+            tokens = tuple(t for t in identifier_tokens(statement.rhs, rhs_start) if t.name != statement.name)
+            statement.reference_tokens = tokens
             if statement.name in definitions:
                 duplicates.setdefault(statement.name, [definitions[statement.name]]).append(statement)
             else:
                 definitions[statement.name] = statement
+            leading = re.match(rf"^\s*({IDENTIFIER_PATTERN})\b", statement.rhs)
+            raw_command = leading.group(1) if leading else None
+            if raw_command and raw_command == raw_command.upper() and raw_command not in COMMANDS:
+                command_start = rhs_start + leading.start(1)
+                issues.append(ParseIssue("unknown-command", f"Unknown command: {raw_command}", command_start, command_start + len(raw_command), _line(source, command_start), True))
+        elif DEFINITION_LIKE_RE.match(text):
+            issues.append(ParseIssue("invalid-definition", "Definition-like statement could not be parsed", start, end, _line(source, start)))
         statements.append(statement)
 
-    known_names = set(definitions)
+    known = set(definitions)
     for statement in statements:
-        if statement.rhs is None:
-            continue
-        candidates = REFERENCE_RE.findall(statement.rhs)
-        statement.references = tuple(
-            dict.fromkeys(
-                candidate for candidate in candidates
-                if candidate in known_names and candidate != statement.name
-            )
-        )
-
-    return ParsedDocument(
-        source, statements, definitions, duplicates, inline_comment_lines
-    )
+        statement.references = tuple(dict.fromkeys(t.name for t in statement.reference_tokens if t.name in known))
+    return ParsedDocument(source, statements, definitions, duplicates, inline_lines, tuple(issues))
 
 
 def identifier_candidates(rhs: str) -> tuple[str, ...]:
-    """Identifiers that might be references, including unresolved names."""
+    """Compatibility helper returning lexically plausible references."""
+    return tuple(dict.fromkeys(token.name for token in identifier_tokens(rhs)))
 
-    candidates = REFERENCE_RE.findall(rhs)
-    return tuple(
-        dict.fromkeys(name for name in candidates if name.lower() not in RESERVED_WORDS)
-    )
+
+def _has_inline_percent(line: str) -> bool:
+    quote: str | None = None
+    for index, char in enumerate(line):
+        if quote:
+            if char == quote and (index == 0 or line[index - 1] != "\\"):
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "%":
+            return bool(line[:index].strip())
+    return False
