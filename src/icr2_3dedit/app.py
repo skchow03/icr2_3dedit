@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import logging
+import queue
 import re
+import threading
+import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -12,10 +16,30 @@ from .document import SourceDocument
 from .parser import ParsedDocument, Statement, parse_document
 from .semantics import build_reference_graph
 from .geometry import GeometryModel, VertexDefinition, build_geometry_model
-from .syntax import COMMANDS
+from .responsive import (GenerationGuard, HIGHLIGHT_OPERATION_BUDGET,
+                         highlight_spans, line_offsets, offsets_for_lines,
+                         viewport_line_range)
 
 
 OUTLINE_KINDS = ("All", "Vertex", "POLY", "LIST", "BSPF", "DYNAMIC", "SUPEROBJ", "Other")
+LOGGER = logging.getLogger(__name__)
+
+
+def _timed(timings: dict[str, float], name: str, function, *args):
+    started = time.perf_counter()
+    value = function(*args)
+    timings[name] = time.perf_counter() - started
+    return value
+
+
+def _analyze_snapshot(generation: int, source: str):
+    """Perform every widget-free analysis stage on an immutable snapshot."""
+    timings: dict[str, float] = {}
+    parsed = _timed(timings, "parsing", parse_document, source)
+    geometry = _timed(timings, "geometry model", build_geometry_model, parsed)
+    graph = _timed(timings, "reference graph", build_reference_graph, parsed)
+    diagnostics = _timed(timings, "diagnostics analysis", analyze, parsed, geometry)
+    return generation, parsed, geometry, graph, diagnostics, timings
 
 
 def statement_matches_filter(statement: Statement, name_filter: str, kind_filter: str) -> bool:
@@ -41,6 +65,17 @@ class EditorWindow(tk.Tk):
         self.geometry_model = build_geometry_model(self.parsed)
         self.reference_graph = build_reference_graph(self.parsed)
         self._refresh_job: str | None = None
+        self._highlight_job: str | None = None
+        self._guard = GenerationGuard()
+        self._parsed_generation = -1
+        self._closing = False
+        self._line_offsets = line_offsets("")
+        self._token_starts: tuple[int, ...] = ()
+        self._analysis_condition = threading.Condition()
+        self._pending_analysis: tuple[int, str] | None = None
+        self._analysis_results: queue.Queue = queue.Queue()
+        self._worker = threading.Thread(target=self._analysis_worker, name="3d-analysis", daemon=True)
+        self._worker.start()
         self._statement_by_item: dict[str, Statement] = {}
         self._diagnostic_by_item: dict[str, object] = {}
         self._build_menu()
@@ -50,6 +85,7 @@ class EditorWindow(tk.Tk):
         self.document = SourceDocument(self.editor.get("1.0", "end-1c"))
         self._update_title()
         self.protocol("WM_DELETE_WINDOW", self.exit_editor)
+        self.after(50, self._poll_analysis_results)
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
@@ -155,7 +191,7 @@ class EditorWindow(tk.Tk):
         self.editor.bind("<<Modified>>", self._text_modified)
         self.editor.bind("<ButtonRelease-1>", self._cursor_changed)
         self.editor.bind("<KeyRelease>", self._cursor_changed)
-        self.editor.bind("<Configure>", self._redraw_line_numbers, add=True)
+        self.editor.bind("<Configure>", self._viewport_changed, add=True)
 
         notebook = ttk.Notebook(right)
         notebook.pack(fill=tk.BOTH, expand=True)
@@ -194,24 +230,36 @@ class EditorWindow(tk.Tk):
         self.editor.tag_configure("selected_statement", background="#fff4c2")
 
     def _set_text(self, text: str) -> None:
+        started = time.perf_counter()
         self.editor.delete("1.0", tk.END)
         self.editor.insert("1.0", text)
+        LOGGER.info("open stage insertion into Text: %.3fs", time.perf_counter() - started)
         self.editor.edit_modified(False)
-        # Let Tk paint a large source file before running structural analysis.
+        generation = self._guard.invalidate()
+        self._line_offsets = line_offsets(text)
+        self._parsed_generation = -1
+        self.status.configure(text="Loading source…")
+        self._schedule_highlight()
+        # Let Tk paint and accept input before structural work begins.
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
-        self._refresh_job = self.after_idle(self._refresh_model)
+        self._refresh_job = self.after_idle(lambda: self._begin_analysis(generation, text))
 
     def _text_modified(self, _event: tk.Event) -> None:
         if not self.editor.edit_modified():
             return
         self.editor.edit_modified(False)
         self.document.text = self.editor.get("1.0", "end-1c")
+        self._line_offsets = line_offsets(self.document.text)
+        self._guard.invalidate()
+        self._parsed_generation = -1
         self._update_title()
         if self._refresh_job is not None:
             self.after_cancel(self._refresh_job)
-        self._refresh_job = self.after(250, self._refresh_model)
+        generation, source = self._guard.generation, self.document.text
+        self._refresh_job = self.after(250, lambda: self._begin_analysis(generation, source))
         self._redraw_line_numbers()
+        self._schedule_highlight()
 
     def _editor_scrolled(
         self,
@@ -221,10 +269,16 @@ class EditorWindow(tk.Tk):
     ) -> None:
         scrollbar.set(first, last)
         self._redraw_line_numbers()
+        self._schedule_highlight()
+
+    def _viewport_changed(self, event: tk.Event | None = None) -> None:
+        self._redraw_line_numbers(event)
+        self._schedule_highlight()
 
     def _redraw_line_numbers(self, _event: tk.Event | None = None) -> None:
         """Draw numbers beside each source line currently visible in the editor."""
 
+        started = time.perf_counter()
         self.line_numbers.delete("all")
         index = self.editor.index("@0,0")
         while True:
@@ -245,19 +299,78 @@ class EditorWindow(tk.Tk):
 
         digits = max(2, len(self.editor.index("end-1c").split(".", 1)[0]))
         self.line_numbers.configure(width=12 + digits * 8)
+        LOGGER.debug("refresh stage line numbers: %.3fs", time.perf_counter() - started)
 
     def _refresh_model(self) -> None:
+        """Compatibility entry point: enqueue, rather than blocking Tk."""
         self._refresh_job = None
         text = self.editor.get("1.0", "end-1c")
         self.document.text = text
-        self.parsed = parse_document(text)
-        self.geometry_model = build_geometry_model(self.parsed)
-        self.reference_graph = build_reference_graph(self.parsed)
+        generation = self._guard.invalidate()
+        self._line_offsets = line_offsets(text)
+        self._begin_analysis(generation, text)
+
+    def _begin_analysis(self, generation: int, source: str) -> None:
+        self._refresh_job = None
+        if not self._guard.accepts(generation):
+            return
+        self.status.configure(text="Analyzing…")
+        with self._analysis_condition:
+            self._pending_analysis = (generation, source)
+            self._analysis_condition.notify()
+
+    def _analysis_worker(self) -> None:
+        while True:
+            with self._analysis_condition:
+                while self._pending_analysis is None and not self._closing:
+                    self._analysis_condition.wait()
+                if self._closing:
+                    return
+                request, self._pending_analysis = self._pending_analysis, None
+            try:
+                self._analysis_results.put(("ok", _analyze_snapshot(*request)))
+            except Exception:
+                self._analysis_results.put(("error", request[0], traceback.format_exc()))
+
+    def _poll_analysis_results(self) -> None:
+        if self._closing:
+            return
+        try:
+            while True:
+                result = self._analysis_results.get_nowait()
+                if result[0] == "error":
+                    if self._guard.accepts(result[1]):
+                        LOGGER.error("Deferred analysis failed:\n%s", result[2])
+                        messagebox.showerror("Analysis failed", "Analysis failed; details were written to the log.")
+                    continue
+                _, payload = result
+                self._apply_analysis_result(*payload)
+        except queue.Empty:
+            pass
+        except Exception:
+            LOGGER.exception("Deferred Tk callback failed")
+            messagebox.showerror("Refresh failed", "The editor refresh failed; details were written to the log.")
+        if not self._closing:
+            self.after(50, self._poll_analysis_results)
+
+    def _apply_analysis_result(self, generation, parsed, geometry, graph, diagnostics, timings) -> None:
+        if not self._guard.accepts(generation):
+            return
+        self.parsed, self.geometry_model, self.reference_graph = parsed, geometry, graph
+        self._parsed_generation = generation
+        self._token_starts = tuple(token.start for token in parsed.tokens)
+        started = time.perf_counter()
         self._populate_outline()
+        timings["outline population"] = time.perf_counter() - started
+        started = time.perf_counter()
         self._show_geometry_summary()
+        timings["geometry summary"] = time.perf_counter() - started
+        started = time.perf_counter()
+        self._populate_diagnostics(diagnostics)
+        timings["diagnostics population"] = time.perf_counter() - started
         self._highlight_source()
-        self.refresh_analysis()
-        self.status.configure(text=f"{len(self.parsed.definitions)} definitions, {len(self.parsed.statements)} statements")
+        self.status.configure(text=f"{len(parsed.definitions)} definitions, {len(parsed.statements)} statements")
+        LOGGER.info("refresh timings: %s", ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in timings.items()))
 
     def _populate_outline(self) -> None:
         selected_names = [self._statement_by_item[item].name for item in self.outline.selection() if item in self._statement_by_item]
@@ -279,24 +392,46 @@ class EditorWindow(tk.Tk):
             self.outline.yview_moveto(yview[0])
 
     def _highlight_source(self) -> None:
+        self._highlight_job = None
+        started = time.perf_counter()
+        first = int(self.editor.index("@0,0").split(".")[0])
+        last = int(self.editor.index(f"@0,{max(0, self.editor.winfo_height() - 1)}").split(".")[0])
+        bounded = viewport_line_range(first, last, len(self._line_offsets) - 1)
+        start, end = offsets_for_lines(self._line_offsets, *bounded)
+        parsed = self.parsed if self._parsed_generation == self._guard.generation else None
+        spans = highlight_spans(self.document.text, first, last, parsed=parsed,
+                                budget=HIGHLIGHT_OPERATION_BUDGET,
+                                cached_line_offsets=self._line_offsets,
+                                cached_token_starts=self._token_starts if parsed else None)
         for tag in ("definition", "command", "number", "comment"):
-            self.editor.tag_remove(tag, "1.0", tk.END)
-        patterns = {
-            "definition": r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)\s*:",
-            "command": rf"\b(?:{'|'.join(sorted(COMMANDS))})\b",
-            "number": r"(?<![A-Za-z_])[-+]?(?:\d+\.\d*|\.\d+|\d+)(?![A-Za-z_])",
-            "comment": r"(?m)^[ \t]*%[^\r\n]*",
-        }
-        source = self.document.text
-        for tag, pattern in patterns.items():
-            for match in re.finditer(pattern, source, re.IGNORECASE):
-                group = 1 if tag == "definition" else 0
-                self.editor.tag_add(tag, self._offset_index(match.start(group)), self._offset_index(match.end(group)))
+            self.editor.tag_remove(tag, self._offset_index(start), self._offset_index(end))
+            ranges = [(self._offset_index(span.start), self._offset_index(span.end)) for span in spans if span.tag == tag]
+            if ranges:
+                flat = [index for pair in ranges for index in pair]
+                self.editor.tk.call(self.editor._w, "tag", "add", tag, *flat)
+        LOGGER.debug("refresh stage viewport highlighting: %.3fs, %d spans, <=4 add operations",
+                     time.perf_counter() - started, len(spans))
+
+    def _schedule_highlight(self) -> None:
+        if self._highlight_job is not None:
+            self.after_cancel(self._highlight_job)
+        self._highlight_job = self.after(40, self._safe_highlight)
+
+    def _safe_highlight(self) -> None:
+        try:
+            self._highlight_source()
+        except Exception:
+            self._highlight_job = None
+            LOGGER.exception("Deferred syntax highlighting failed")
+            messagebox.showerror("Highlighting failed", "Syntax highlighting failed; details were written to the log.")
 
     def refresh_analysis(self) -> None:
+        self._refresh_model()
+
+    def _populate_diagnostics(self, diagnostics) -> None:
         self.diagnostics.delete(*self.diagnostics.get_children())
         self._diagnostic_by_item.clear()
-        for diagnostic in analyze(self.parsed, self.geometry_model):
+        for diagnostic in diagnostics[:500]:
             item = self.diagnostics.insert(
                 "", tk.END,
                 text=diagnostic.message,
@@ -337,6 +472,7 @@ class EditorWindow(tk.Tk):
         self.editor.tag_add("selected_statement", start, end)
         self.editor.mark_set(tk.INSERT, start)
         self.editor.see(start)
+        self._schedule_highlight()
         self._show_inspector(statement)
 
     def _show_inspector(self, statement: Statement) -> None:
@@ -450,7 +586,10 @@ class EditorWindow(tk.Tk):
         if not filename:
             return
         try:
+            self.status.configure(text="Loading source…")
+            started = time.perf_counter()
             self.document = SourceDocument.load(filename)
+            LOGGER.info("open stage file reading and decoding: %.3fs", time.perf_counter() - started)
             self._set_text(self.document.text)
             self._update_title()
         except OSError as error:
@@ -489,6 +628,11 @@ class EditorWindow(tk.Tk):
 
     def exit_editor(self) -> None:
         if self._confirm_discard():
+            self._closing = True
+            self._guard.close()
+            with self._analysis_condition:
+                self._pending_analysis = None
+                self._analysis_condition.notify_all()
             self.destroy()
 
     def _line_offset(self, line: int) -> int:
@@ -503,6 +647,7 @@ class EditorWindow(tk.Tk):
         self.editor.mark_set(tk.INSERT, first)
         self.editor.see(first)
         self.editor.focus_set()
+        self._schedule_highlight()
 
     def find_dialog(self) -> None:
         query = simpledialog.askstring("Find", "Text to find:", parent=self)
@@ -528,6 +673,7 @@ class EditorWindow(tk.Tk):
         if line is not None:
             self.editor.mark_set(tk.INSERT, f"{line}.0")
             self.editor.see(tk.INSERT)
+            self._schedule_highlight()
 
     def _identifier_at_cursor(self) -> str | None:
         if self.editor.tag_ranges(tk.SEL):
