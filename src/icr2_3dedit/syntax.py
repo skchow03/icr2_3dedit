@@ -1,20 +1,53 @@
-"""Shared lexical knowledge for parsing and source highlighting."""
+"""Lossless lexical primitives for Papyrus ``.3D`` source.
+
+The lexer deliberately assigns a token to every byte of decoded source.  Parsing
+can therefore attach meaning to spans without ever becoming a pretty-printer.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import re
 
 
 COMMANDS = frozenset({
-    "NIL", "POLY", "POLYGON", "LIST", "BSPF", "DYNAMIC", "DYNO",
-    "SUPEROBJ", "SWITCH", "DATA", "EXTERN",
+    "NIL", "FACE", "POLY", "POLYGON", "LINE", "LIST", "BSPF", "BSPA",
+    "MATERIAL", "DYNAMIC", "DYNO", "SUPEROBJ", "SWITCH", "DATA", "EXTERN",
 })
-KEYWORDS = frozenset({"3D", "VERSION", "AND", "OR", "NOT", "TRUE", "FALSE"})
+KEYWORDS = frozenset({
+    "3D", "VERSION", "AND", "OR", "NOT", "TRUE", "FALSE", "GROUP", "MIP",
+    "DISTANCE",
+})
+RECORD_FIELDS = frozenset({"C", "T"})
 RESERVED_WORDS = COMMANDS | KEYWORDS
-IDENTIFIER_PATTERN = r"[A-Za-z_][A-Za-z0-9_]*"
-IDENTIFIER_RE = re.compile(IDENTIFIER_PATTERN)
-COMMAND_PATTERN = re.compile(rf"^\s*({IDENTIFIER_PATTERN})\b")
+
+
+class TokenKind(str, Enum):
+    WHITESPACE = "whitespace"
+    COMMENT = "comment"
+    IDENTIFIER = "identifier"
+    NUMBER = "number"
+    STRING = "string"
+    COMMA = "comma"
+    SEMICOLON = "semicolon"
+    COLON = "colon"
+    EQUALS = "equals"
+    QUESTION = "question"
+    DOT = "dot"
+    OPEN = "open"
+    CLOSE = "close"
+    SYMBOL = "symbol"
+
+
+@dataclass(frozen=True, slots=True)
+class Token:
+    kind: TokenKind
+    text: str
+    start: int
+    end: int
+    line: int
+    column: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,62 +57,59 @@ class IdentifierToken:
     end: int
 
 
-def identifier_tokens(text: str, offset: int = 0) -> tuple[IdentifierToken, ...]:
-    """Return identifiers outside strings and full-line percent comments."""
+_SINGLE = {
+    ",": TokenKind.COMMA, ";": TokenKind.SEMICOLON, ":": TokenKind.COLON,
+    "=": TokenKind.EQUALS, "?": TokenKind.QUESTION, ".": TokenKind.DOT,
+    "{": TokenKind.OPEN, "(": TokenKind.OPEN, "[": TokenKind.OPEN,
+    "<": TokenKind.OPEN, "}": TokenKind.CLOSE, ")": TokenKind.CLOSE,
+    "]": TokenKind.CLOSE, ">": TokenKind.CLOSE,
+}
 
-    result: list[IdentifierToken] = []
-    index = 0
-    quote: str | None = None
-    comment = False
-    line_nonspace = False
-    while index < len(text):
-        char = text[index]
-        if comment:
-            if char in "\r\n":
-                comment = False
-                line_nonspace = False
-            index += 1
-            continue
-        if quote:
-            if char == "\\" and index + 1 < len(text):
-                index += 2
-                continue
-            if char == quote:
-                quote = None
-            if char in "\r\n":
-                line_nonspace = False
-            index += 1
-            continue
-        if char in "\r\n":
-            line_nonspace = False
-            index += 1
-            continue
-        if char in " \t" and not line_nonspace:
-            index += 1
-            continue
-        if char == "%" and not line_nonspace:
-            comment = True
-            index += 1
-            continue
-        line_nonspace = True
-        if char in "\"'":
-            quote = char
-            index += 1
-            continue
-        match = IDENTIFIER_RE.match(text, index)
-        if match and index and (text[index - 1].isalnum() or text[index - 1] == "_"):
-            index += 1
-            continue
-        if match:
-            name = match.group(0)
-            if name.upper() not in RESERVED_WORDS:
-                result.append(IdentifierToken(name, offset + match.start(), offset + match.end()))
-            index = match.end()
-            continue
-        index += 1
+_TOKEN_RE = re.compile(
+    r"(?P<whitespace>\s+)|(?P<comment>%[^\r\n]*)|"
+    r"(?P<string>\"(?:\\.|[^\"\\])*\"?|'(?:\\.|[^'\\])*'?)|"
+    r"(?P<identifier>3[Dd](?![A-Za-z0-9_])|[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)|"
+    r"(?P<number>[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?))|"
+    r"(?P<punctuation>[,;:=?.{}()\[\]<>])|(?P<symbol>.)",
+    re.DOTALL,
+)
+
+
+def tokenize(source: str, offset: int = 0, line: int = 1, column: int = 1) -> tuple[Token, ...]:
+    """Tokenize *source* tolerantly, retaining trivia and exact source spans."""
+    result: list[Token] = []
+    current_line, current_column = line, column
+    names = {
+        "whitespace": TokenKind.WHITESPACE, "comment": TokenKind.COMMENT,
+        "string": TokenKind.STRING, "identifier": TokenKind.IDENTIFIER,
+        "number": TokenKind.NUMBER, "symbol": TokenKind.SYMBOL,
+    }
+    for match in _TOKEN_RE.finditer(source):
+        raw = match.group(0)
+        kind = _SINGLE.get(raw, names.get(match.lastgroup or "", TokenKind.SYMBOL))
+        result.append(Token(kind, raw, offset + match.start(), offset + match.end(),
+                            current_line, current_column))
+        newline_count = raw.count("\n")
+        if newline_count:
+            current_line += newline_count
+            current_column = len(raw.rsplit("\n", 1)[1]) + 1
+        else:
+            current_column += len(raw)
     return tuple(result)
 
 
+def identifier_tokens(text: str, offset: int = 0) -> tuple[IdentifierToken, ...]:
+    """Compatibility helper returning non-reserved identifiers outside trivia."""
+    return tuple(
+        IdentifierToken(token.text, token.start, token.end)
+        for token in tokenize(text, offset)
+        if token.kind is TokenKind.IDENTIFIER and token.text.upper() not in RESERVED_WORDS
+    )
+
+
 def command_at_start(rhs: str) -> str | None:
-    match = COMMAND_PATTERN.match(rhs)
-    return match.group(1).upper() if match else None
+    for token in tokenize(rhs):
+        if token.kind in (TokenKind.WHITESPACE, TokenKind.COMMENT):
+            continue
+        return token.text.upper() if token.kind is TokenKind.IDENTIFIER else None
+    return None

@@ -10,7 +10,8 @@ editor with navigation and analysis rather than a general-purpose CAD program.
   retain their original newline convention and encoding
 - Dirty-state indication and Save/Discard/Cancel protection for New, Open, Exit,
   and window close
-- Statement outline with definition names and inferred kinds
+- Nesting-aware statement outline with definition names (including generated
+  hyphenated names), exact source spans, and conservatively inferred kinds
 - Case-insensitive outline name filtering, kind filtering, and scrolling
 - Definition/reference navigation
 - Typed, read-only vertex parsing with exact coordinate source spans and original
@@ -26,8 +27,12 @@ editor with navigation and analysis rather than a general-purpose CAD program.
   and full-line `%` comments
 - Error diagnostics when `%` is used as an inline comment (unsupported by `.3D`)
 
-The parser is deliberately conservative. It keeps the original source as the
-authority and records source ranges instead of regenerating the document.
+The parser is deliberately conservative. A tolerant tokenizer retains every
+character (including whitespace, comments, and original numeric spelling), and
+a concrete syntax layer balances nested `{}`, `()`, `[]`, and `<>` groups. The
+original source remains authoritative: statements, tokens, and groups point at
+source ranges instead of regenerating the document. Both semicolon and
+line-terminated `3D VERSION 3.0` headers are accepted.
 Percent comments are recognized only when `%` is the first non-whitespace
 character on a line. Command recognition is centralized, but command argument
 shapes remain intentionally untyped because the complete Papyrus grammar has
@@ -38,13 +43,16 @@ verified.
 
 The typed geometry layer understands the Wasp/roadcar-style optional texture
 suffix after a vertex position (for example, `, T=<u, v>`), while treating only
-the first `<x, y, z>` tuple as position. Values are not assigned an assumed
+the first `<x, y, z>` tuple as position. Attribute-bearing records such as
+`[<0,0,0>, c=<248>]` are preserved but are not guessed to be spatial vertices.
+Values are not assigned an assumed
 physical unit: the interface calls them source units until conversion behavior
 is explicitly configured.
 
 ## Known limitations
 
-- Polygon (`POLY`) arguments and geometry are not typed or editable yet.
+- `FACE`, BSP, polygon, and line geometry are preserved and labeled but are not
+  typed or included in geometry calculations yet.
 - Coordinate modification and structured geometry editing are not implemented.
 - There is no graphical model preview or OpenGL integration.
 - Scientific notation is accepted for analysis only; compiler compatibility is

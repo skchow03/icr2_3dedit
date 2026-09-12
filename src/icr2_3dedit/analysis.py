@@ -10,6 +10,9 @@ from .semantics import build_reference_graph
 from .geometry import GeometryModel, build_geometry_model
 
 
+MAX_DIAGNOSTICS = 200
+
+
 class Severity(str, Enum):
     ERROR = "error"
     WARNING = "warning"
@@ -52,7 +55,14 @@ def analyze(document: ParsedDocument, geometry: GeometryModel | None = None) -> 
     for cycle in graph.cycles:
         statement = document.definitions[cycle[0]]
         diagnostics.append(Diagnostic(Severity.WARNING, f"Reference cycle: {' -> '.join(cycle)}", statement.line, statement, statement.name_start, statement.name_end))
-    return sorted(diagnostics, key=lambda item: (item.line, item.severity.value, item.message))
+    diagnostics.sort(key=lambda item: (item.line, item.severity.value, item.message))
+    if len(diagnostics) > MAX_DIAGNOSTICS:
+        omitted = len(diagnostics) - (MAX_DIAGNOSTICS - 1)
+        diagnostics = diagnostics[:MAX_DIAGNOSTICS - 1]
+        diagnostics.append(Diagnostic(
+            Severity.INFO, f"{omitted} additional diagnostics omitted", 1,
+        ))
+    return diagnostics
 
 
 def _token_line(source: str, start: int) -> int:

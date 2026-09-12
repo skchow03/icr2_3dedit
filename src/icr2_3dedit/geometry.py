@@ -7,6 +7,7 @@ import math
 import re
 
 from .parser import ParsedDocument, Statement
+from .syntax import TokenKind
 
 
 NUMBER_RE = re.compile(r"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|inf(?:inity)?|nan)\Z", re.IGNORECASE)
@@ -85,6 +86,7 @@ class GeometryModel:
     vertices: dict[str, VertexDefinition]
     bounds: Bounds3D | None
     issues: tuple[GeometryIssue, ...] = field(default_factory=tuple)
+    unsupported_constructs: tuple[str, ...] = field(default_factory=tuple)
 
     def coincident_names(self, vertex: VertexDefinition) -> tuple[str, ...]:
         return tuple(
@@ -125,12 +127,18 @@ def build_geometry_model(document: ParsedDocument) -> GeometryModel:
             min(v.y for v in values), max(v.y for v in values),
             min(v.z for v in values), max(v.z for v in values),
         )
-    return GeometryModel(vertices, bounds, tuple(issues))
+    unsupported = tuple(dict.fromkeys(
+        token.text.upper() for token in document.tokens
+        if token.kind is TokenKind.IDENTIFIER and token.text.upper() in {
+            "FACE", "BSPA", "BSPF", "POLY", "POLYGON", "LINE",
+        }
+    ))
+    return GeometryModel(vertices, bounds, tuple(issues), unsupported)
 
 
 def _parse_vertex(statement: Statement) -> tuple[VertexDefinition | None, list[GeometryIssue]]:
     rhs = statement.rhs
-    if statement.name is None or rhs is None or statement.rhs_start is None:
+    if statement.name is None or rhs is None or statement.rhs_start is None or statement.kind != "vertex":
         return None, []
     opening = VERTEX_START_RE.match(rhs)
     if opening is None:

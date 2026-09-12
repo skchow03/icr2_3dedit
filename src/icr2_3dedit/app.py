@@ -197,7 +197,10 @@ class EditorWindow(tk.Tk):
         self.editor.delete("1.0", tk.END)
         self.editor.insert("1.0", text)
         self.editor.edit_modified(False)
-        self._refresh_model()
+        # Let Tk paint a large source file before running structural analysis.
+        if self._refresh_job is not None:
+            self.after_cancel(self._refresh_job)
+        self._refresh_job = self.after_idle(self._refresh_model)
 
     def _text_modified(self, _event: tk.Event) -> None:
         if not self.editor.edit_modified():
@@ -279,7 +282,7 @@ class EditorWindow(tk.Tk):
         for tag in ("definition", "command", "number", "comment"):
             self.editor.tag_remove(tag, "1.0", tk.END)
         patterns = {
-            "definition": r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:",
+            "definition": r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)\s*:",
             "command": rf"\b(?:{'|'.join(sorted(COMMANDS))})\b",
             "number": r"(?<![A-Za-z_])[-+]?(?:\d+\.\d*|\.\d+|\d+)(?![A-Za-z_])",
             "comment": r"(?m)^[ \t]*%[^\r\n]*",
@@ -406,6 +409,11 @@ class EditorWindow(tk.Tk):
                 f"Z: min {bounds.min_z:g}  max {bounds.max_z:g}  size {bounds.size_z:g}\n\n"
                 "Bounding-box center (source units):\n"
                 f"X {cx:g}\nY {cy:g}\nZ {cz:g}"
+            )
+        if self.geometry_model.unsupported_constructs:
+            text += (
+                "\n\nPreserved but not geometrically analyzed: "
+                + ", ".join(self.geometry_model.unsupported_constructs)
             )
         self.geometry_summary.configure(text=text)
 
