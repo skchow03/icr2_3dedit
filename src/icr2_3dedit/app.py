@@ -6,9 +6,12 @@ import logging
 import queue
 import threading
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Callable
 
+from .editing import ThreeDEditSession
 from .inspector import TREE_CHILD_BATCH, ThreeDInspectorModel
 from .parser import Statement
 from .threedfile import ThreeDDiagnostic, ThreeDFile
@@ -16,6 +19,59 @@ from .threedfile import ThreeDDiagnostic, ThreeDFile
 
 LOGGER = logging.getLogger(__name__)
 OUTLINE_KINDS = ("All", "Vertex", "POLY", "LIST", "BSPF", "DYNAMIC", "SUPEROBJ", "Other")
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralSelectionAnchor:
+    """A source-tree location that can be resolved after a reparse."""
+
+    root_index: int
+    child_indexes: tuple[int, ...]
+
+
+def capture_selection_anchor(
+    document: ThreeDFile,
+    node_id: int | None,
+) -> StructuralSelectionAnchor | None:
+    """Capture a node by source-tree indexes rather than transient NodeID."""
+    if node_id is None or node_id not in document.nodes_by_id:
+        return None
+    indexes: list[int] = []
+    current_id = node_id
+    while True:
+        current = document.nodes_by_id[current_id]
+        if current.parent_id is None:
+            try:
+                root_index = document.top_level_nodes.index(current_id)
+            except ValueError:
+                return None
+            return StructuralSelectionAnchor(root_index, tuple(reversed(indexes)))
+        parent = document.nodes_by_id[current.parent_id]
+        try:
+            indexes.append(parent.children.index(current_id))
+        except ValueError:
+            return None
+        current_id = parent.node_id
+
+
+def resolve_selection_anchor(
+    document: ThreeDFile,
+    anchor: StructuralSelectionAnchor | None,
+) -> int | None:
+    """Resolve a captured location against a freshly parsed document."""
+    if (
+        anchor is None
+        or anchor.root_index < 0
+        or anchor.root_index >= len(document.top_level_nodes)
+    ):
+        return None
+    node_id = document.top_level_nodes[anchor.root_index]
+    for child_index in anchor.child_indexes:
+        children = document.nodes_by_id[node_id].children
+        if child_index < 0 or child_index >= len(children):
+            return None
+        node_id = children[child_index]
+    return node_id
 
 
 def statement_matches_filter(statement: Statement, name_filter: str, kind_filter: str) -> bool:
@@ -133,7 +189,7 @@ class LazyStructureTree:
 
 
 class EditorWindow(tk.Tk):
-    """Read-only structural browser backed exclusively by ThreeDFile."""
+    """Lazy structural browser and command-based editor for ThreeDFile."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -142,6 +198,7 @@ class EditorWindow(tk.Tk):
         self.minsize(920, 580)
 
         self.document: ThreeDFile | None = None
+        self.session: ThreeDEditSession | None = None
         self.model: ThreeDInspectorModel | None = None
         self.lazy_tree: LazyStructureTree | None = None
         self._load_generation = 0
@@ -151,6 +208,7 @@ class EditorWindow(tk.Tk):
         self._reference_rows = ()
         self._reverse_rows = ()
         self._diagnostic_by_item: dict[str, ThreeDDiagnostic] = {}
+        self._busy = False
         self._closing = False
 
         self._build_menu()
@@ -160,13 +218,33 @@ class EditorWindow(tk.Tk):
 
     def _build_menu(self) -> None:
         menu = tk.Menu(self)
-        file_menu = tk.Menu(menu, tearoff=False)
-        file_menu.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_file)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.exit_inspector)
-        menu.add_cascade(label="File", menu=file_menu)
+        self.file_menu = tk.Menu(menu, tearoff=False)
+        self.file_menu.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_file)
+        self.file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_file)
+        self.file_menu.add_command(
+            label="Save As…", accelerator="Ctrl+Shift+S",
+            command=lambda: self.save_file(True),
+        )
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.exit_inspector)
+        menu.add_cascade(label="File", menu=self.file_menu)
+
+        self.edit_menu = tk.Menu(menu, tearoff=False)
+        self.edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
+        self.edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self.redo)
+        self.edit_menu.add_separator()
+        self.edit_menu.add_command(
+            label="Rename Definition…", accelerator="F2",
+            command=self.rename_selected_definition,
+        )
+        menu.add_cascade(label="Edit", menu=self.edit_menu)
         self.config(menu=menu)
         self.bind_all("<Control-o>", lambda _event: self.open_file())
+        self.bind_all("<Control-s>", lambda _event: self.save_file())
+        self.bind_all("<Control-Shift-s>", lambda _event: self.save_file(True))
+        self.bind_all("<Control-z>", lambda _event: self.undo())
+        self.bind_all("<Control-y>", lambda _event: self.redo())
+        self.bind_all("<F2>", lambda _event: self.rename_selected_definition())
 
     def _build_ui(self) -> None:
         outer = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -206,6 +284,11 @@ class EditorWindow(tk.Tk):
         self.structure.bind("<<TreeviewSelect>>", self._tree_selected)
         self.structure.bind("<Double-1>", self._tree_double_clicked, add=True)
         self.structure.bind("<Return>", self._tree_activate, add=True)
+        self.structure.bind("<Button-3>", self._tree_context_menu, add=True)
+        self.tree_menu = tk.Menu(self.structure, tearoff=False)
+        self.tree_menu.add_command(
+            label="Rename Definition…", command=self.rename_selected_definition
+        )
 
         vertical = ttk.Panedwindow(detail_frame, orient=tk.VERTICAL)
         vertical.pack(fill=tk.BOTH, expand=True)
@@ -290,8 +373,11 @@ class EditorWindow(tk.Tk):
         )
         self.status.pack(fill=tk.X, side=tk.BOTTOM)
         self._update_page_buttons(0, 1)
+        self._update_command_states()
 
     def open_file(self) -> None:
+        if self._busy or not self._confirm_save_changes():
+            return
         filename = filedialog.askopenfilename(
             title="Open Papyrus .3D file",
             filetypes=(("Papyrus 3D source", "*.3d *.3D"), ("All files", "*.*")),
@@ -303,6 +389,7 @@ class EditorWindow(tk.Tk):
         path = Path(filename)
         self._load_generation += 1
         generation = self._load_generation
+        self._set_busy(True)
         self.status.configure(text=f"Parsing {path.name}…")
         self.title(f"ICR2 3D Document Inspector — {path.name}")
         self._clear_document_views()
@@ -311,10 +398,11 @@ class EditorWindow(tk.Tk):
             try:
                 document = ThreeDFile.load(path)
                 model = ThreeDInspectorModel(document)
-                self._load_results.put(("ok", generation, document, model))
+                session = ThreeDEditSession(document)
+                self._load_results.put(("load-ok", generation, session, model))
             except Exception as error:
                 LOGGER.exception("Could not load %s", path)
-                self._load_results.put(("error", generation, path, error))
+                self._load_results.put(("load-error", generation, path, error))
 
         threading.Thread(target=worker, name="3d-file-loader", daemon=True).start()
 
@@ -326,24 +414,50 @@ class EditorWindow(tk.Tk):
                 result = self._load_results.get_nowait()
                 if result[1] != self._load_generation:
                     continue
-                if result[0] == "error":
+                if result[0] == "load-error":
                     _, _, path, error = result
                     messagebox.showerror("Open failed", f"{path}\n\n{error}")
                     self.status.configure(text="Open failed.")
+                    self._set_busy(False)
+                elif result[0] == "edit-error":
+                    _, _, operation, error = result
+                    messagebox.showerror(f"{operation} failed", str(error))
+                    self.status.configure(text=f"{operation} failed.")
+                    self._set_busy(False)
                 else:
-                    _, _, document, model = result
-                    self._apply_document(document, model)
+                    _, _, session, model, *details = result
+                    selected_node_id = details[0] if details else None
+                    operation = details[1] if len(details) > 1 else None
+                    self._apply_document(session, model, selected_node_id, operation)
         except queue.Empty:
             pass
         if not self._closing:
             self.after(50, self._poll_load_results)
 
-    def _apply_document(self, document: ThreeDFile, model: ThreeDInspectorModel) -> None:
+    def _apply_document(
+        self,
+        session: ThreeDEditSession,
+        model: ThreeDInspectorModel,
+        selected_node_id: int | None = None,
+        operation: str | None = None,
+    ) -> None:
+        document = session.document
+        self.session = session
         self.document = document
         self.model = model
+        self._selected_node_id = None
         self.lazy_tree = LazyStructureTree(self.structure, model)
         self.lazy_tree.populate_roots()
         self._populate_diagnostics()
+        self._set_busy(False)
+        if selected_node_id is not None:
+            # Only roots exist as GUI rows after a rebuild. If an undo/redo was
+            # invoked while inspecting a descendant, select its owning
+            # definition instead of eagerly recreating the expanded path.
+            visible_node_id = selected_node_id
+            while self.document.nodes_by_id[visible_node_id].parent_id is not None:
+                visible_node_id = self.document.nodes_by_id[visible_node_id].parent_id
+            self.inspect_node(visible_node_id)
         self.status.configure(
             text=(
                 f"{len(document.top_level_nodes):,} definitions · "
@@ -351,8 +465,10 @@ class EditorWindow(tk.Tk):
                 f"{len(document.references):,} references · "
                 f"{len(document.diagnostics):,} diagnostics · "
                 f"parsed in {document.parse_seconds:.2f}s"
+                + (f" · {operation}" if operation else "")
             )
         )
+        self._update_title()
 
     def _clear_document_views(self) -> None:
         roots = self.structure.get_children("")
@@ -367,9 +483,11 @@ class EditorWindow(tk.Tk):
         self._set_source_text("")
         self._diagnostic_by_item.clear()
         self.document = None
+        self.session = None
         self.model = None
         self.lazy_tree = None
         self._selected_node_id = None
+        self._update_command_states()
 
     def _tree_opened(self, _event: tk.Event) -> None:
         if self.lazy_tree is not None:
@@ -384,6 +502,7 @@ class EditorWindow(tk.Tk):
             return
         if item.startswith("node:"):
             self.inspect_node(int(item.split(":", 1)[1]))
+        self._update_command_states()
 
     def _tree_double_clicked(self, event: tk.Event) -> None:
         item = self.structure.identify_row(event.y)
@@ -394,6 +513,18 @@ class EditorWindow(tk.Tk):
         selected = self.structure.selection()
         if selected and self.lazy_tree is not None:
             self.lazy_tree.load_more(selected[0])
+
+    def _tree_context_menu(self, event: tk.Event) -> None:
+        item = self.structure.identify_row(event.y)
+        if not item or not item.startswith("node:"):
+            return
+        self.structure.selection_set(item)
+        self.structure.focus(item)
+        self.inspect_node(int(item.split(":", 1)[1]))
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
 
     def inspect_node(self, node_id: int) -> None:
         if self.model is None:
@@ -410,6 +541,7 @@ class EditorWindow(tk.Tk):
         self._show_node_source()
         assert self.lazy_tree is not None
         self.lazy_tree.select_node(node_id)
+        self._update_command_states()
 
     def _populate_properties(self, node_id: int) -> None:
         rows = self.properties.get_children("")
@@ -515,7 +647,167 @@ class EditorWindow(tk.Tk):
         )
         self._update_page_buttons(0, 1)
 
+    def rename_selected_definition(self) -> None:
+        if self._busy or self.session is None or self.document is None:
+            return
+        node_id = self._selected_node_id
+        node = self.document.nodes_by_id.get(node_id) if node_id is not None else None
+        if node is None or node.kind != "definition" or node.name is None:
+            self.bell()
+            return
+        new_name = simpledialog.askstring(
+            "Rename definition",
+            f"New name for {node.name}:",
+            initialvalue=node.name,
+            parent=self,
+        )
+        if new_name is None or new_name == node.name:
+            return
+        old_name = node.name
+        self._run_edit_operation(
+            f"Renamed {old_name} to {new_name}",
+            lambda session: session.rename_definition(node_id, new_name),
+        )
+
+    def undo(self) -> None:
+        if self._busy or self.session is None or not self.session.can_undo:
+            return
+        description = self.session.undo_description or "edit"
+        anchor = capture_selection_anchor(self.session.document, self._selected_node_id)
+
+        def operation(session: ThreeDEditSession) -> int | None:
+            document = session.undo()
+            return resolve_selection_anchor(document, anchor)
+
+        self._run_edit_operation(f"Undid {description}", operation)
+
+    def redo(self) -> None:
+        if self._busy or self.session is None or not self.session.can_redo:
+            return
+        description = self.session.redo_description or "edit"
+        anchor = capture_selection_anchor(self.session.document, self._selected_node_id)
+
+        def operation(session: ThreeDEditSession) -> int | None:
+            document = session.redo()
+            return resolve_selection_anchor(document, anchor)
+
+        self._run_edit_operation(f"Redid {description}", operation)
+
+    def _run_edit_operation(
+        self,
+        description: str,
+        operation: Callable[[ThreeDEditSession], int | None],
+    ) -> None:
+        assert self.session is not None
+        session = self.session
+        self._load_generation += 1
+        generation = self._load_generation
+        self._set_busy(True)
+        self.status.configure(text=f"{description}… rebuilding document…")
+
+        def worker() -> None:
+            try:
+                selected_node_id = operation(session)
+                model = ThreeDInspectorModel(session.document)
+                self._load_results.put((
+                    "edit-ok", generation, session, model,
+                    selected_node_id, description,
+                ))
+            except Exception as error:
+                LOGGER.exception("%s failed", description)
+                self._load_results.put(("edit-error", generation, description, error))
+
+        threading.Thread(target=worker, name="3d-document-editor", daemon=True).start()
+
+    def save_file(self, save_as: bool = False) -> bool:
+        if self._busy or self.session is None:
+            return False
+        destination = self.session.document.path
+        if save_as or destination is None:
+            initial = destination.name if destination is not None else "untitled.3D"
+            filename = filedialog.asksaveasfilename(
+                title="Save Papyrus .3D file",
+                initialfile=initial,
+                defaultextension=".3D",
+                filetypes=(("Papyrus 3D source", "*.3d *.3D"), ("All files", "*.*")),
+            )
+            if not filename:
+                return False
+            destination = Path(filename)
+        try:
+            self.session.save(destination)
+        except Exception as error:
+            LOGGER.exception("Could not save %s", destination)
+            messagebox.showerror("Save failed", f"{destination}\n\n{error}")
+            return False
+        self.document = self.session.document
+        self.status.configure(text=f"Saved {destination}")
+        self._update_title()
+        self._update_command_states()
+        return True
+
+    def _confirm_save_changes(self) -> bool:
+        if self.document is None or not self.document.dirty:
+            return True
+        name = self.document.path.name if self.document.path is not None else "this document"
+        choice = messagebox.askyesnocancel(
+            "Unsaved changes",
+            f"Save changes to {name}?",
+            parent=self,
+        )
+        if choice is None:
+            return False
+        return self.save_file() if choice else True
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        if hasattr(self, "structure"):
+            self.structure.configure(selectmode="none" if busy else "browse")
+        self._update_command_states()
+
+    def _update_command_states(self) -> None:
+        if not hasattr(self, "file_menu"):
+            return
+        has_document = self.session is not None and not self._busy
+        self.file_menu.entryconfigure(
+            "Open…", state=tk.DISABLED if self._busy else tk.NORMAL
+        )
+        self.file_menu.entryconfigure(
+            "Save", state=tk.NORMAL if has_document else tk.DISABLED
+        )
+        self.file_menu.entryconfigure(
+            "Save As…", state=tk.NORMAL if has_document else tk.DISABLED
+        )
+        can_undo = has_document and self.session is not None and self.session.can_undo
+        can_redo = has_document and self.session is not None and self.session.can_redo
+        self.edit_menu.entryconfigure(
+            "Undo", state=tk.NORMAL if can_undo else tk.DISABLED
+        )
+        self.edit_menu.entryconfigure(
+            "Redo", state=tk.NORMAL if can_redo else tk.DISABLED
+        )
+        node = None
+        if has_document and self.document is not None and self._selected_node_id is not None:
+            node = self.document.nodes_by_id.get(self._selected_node_id)
+        can_rename = node is not None and node.kind == "definition"
+        state = tk.NORMAL if can_rename else tk.DISABLED
+        self.edit_menu.entryconfigure("Rename Definition…", state=state)
+        if hasattr(self, "tree_menu"):
+            self.tree_menu.entryconfigure("Rename Definition…", state=state)
+
+    def _update_title(self) -> None:
+        title = "ICR2 3D Document Inspector"
+        if self.document is not None and self.document.path is not None:
+            marker = "*" if self.document.dirty else ""
+            title += f" — {marker}{self.document.path.name}"
+        self.title(title)
+
     def exit_inspector(self) -> None:
+        if self._busy:
+            self.bell()
+            return
+        if not self._confirm_save_changes():
+            return
         self._closing = True
         self._load_generation += 1
         self.destroy()
