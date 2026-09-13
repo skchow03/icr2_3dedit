@@ -11,8 +11,12 @@ from enum import Enum
 import re
 
 
+# Papyrus .3D language constructs observed in stock ICR2 sources and documented
+# by the community format notes. Keep these separate from user-defined pointer
+# names so the structural reference pass never diagnoses commands as symbols.
 COMMANDS = frozenset({
-    "NIL", "FACE", "POLY", "POLYGON", "LINE", "LIST", "BSPF", "BSPA",
+    "NIL", "FACE", "FACE2", "POLY", "POLYGON", "LINE", "LIST",
+    "BSPF", "BSPN", "BSPA", "BSP2",
     "MATERIAL", "DYNAMIC", "DYNO", "SUPEROBJ", "SWITCH", "DATA", "EXTERN",
 })
 KEYWORDS = frozenset({
