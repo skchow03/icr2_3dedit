@@ -105,3 +105,93 @@ def test_real_fixtures_round_trip_when_present():
         path=fixture_dir/name
         if path.exists():
             raw=path.read_bytes(); doc=ThreeDFile.from_bytes(raw); assert doc.to_bytes()==raw; assert doc.top_level_nodes; assert not doc.diagnostics
+
+def _command(doc, parent_id, name):
+    return next(
+        doc.nodes_by_id[n]
+        for n in doc.nodes_by_id[parent_id].children
+        if doc.nodes_by_id[n].kind=="command" and doc.nodes_by_id[n].command==name
+    )
+
+def test_face_owns_its_child_expression():
+    raw=(b"3D VERSION 3.0;\n"
+         b"root: FACE ([<0,0,0>], [<1,0,0>], [<0,1,0>]), "
+         b"LIST { NIL };\n")
+    doc=ThreeDFile.from_bytes(raw); root=doc.symbols["root"][0]
+    face=_command(doc,root,"FACE")
+    assert [doc.nodes_by_id[n].kind for n in face.children]==["plane","command"]
+    child=doc.nodes_by_id[face.children[1]]
+    assert child.command=="LIST"
+    assert child.parent_id==face.node_id
+    assert doc.node_text(face.node_id).lstrip().startswith("FACE")
+    assert "LIST { NIL }" in doc.node_text(face.node_id)
+
+def test_face_and_bsp_fixed_arity_children_nest_in_source_order():
+    cases={
+        "FACE": 1,
+        "FACE2": 2,
+        "BSPF": 3,
+        "BSPA": 3,
+        "BSP2": 4,
+        "BSPN": 2,
+    }
+    for command,arity in cases.items():
+        children=", ".join("NIL" for _ in range(arity))
+        raw=f"3D VERSION 3.0;\nroot: {command} ([<0,0,0>], [<1,0,0>], [<0,1,0>]), {children};\n".encode()
+        doc=ThreeDFile.from_bytes(raw); root=doc.symbols["root"][0]
+        node=_command(doc,root,command)
+        assert doc.nodes_by_id[node.children[0]].kind=="plane"
+        owned=[doc.nodes_by_id[n] for n in node.children[1:]]
+        assert len(owned)==arity
+        assert all(child.command=="NIL" and child.parent_id==node.node_id for child in owned)
+        assert [child.start for child in owned]==sorted(child.start for child in owned)
+
+def test_nested_bsp_material_and_poly_form_expression_tree():
+    raw=(b"3D VERSION 3.0;\n"
+         b"color: [<0,0,0>, c=<32>];\n"
+         b"root: BSPA ([<0,0,0>], [<1,0,0>], [<0,1,0>]), "
+         b"BSPA ([<0,0,0>], [<1,0,0>], [<0,1,0>]), "
+         b"LIST { NIL }, MATERIAL GROUP=2, POLY color.c { [<0,0,0>] }, NIL, "
+         b"NIL, LIST { NIL };\n")
+    doc=ThreeDFile.from_bytes(raw); root=doc.symbols["root"][0]
+    outer=_command(doc,root,"BSPA")
+    outer_children=[doc.nodes_by_id[n] for n in outer.children if doc.nodes_by_id[n].kind=="command"]
+    assert [n.command for n in outer_children]==["BSPA","NIL","LIST"]
+    inner=outer_children[0]
+    inner_children=[doc.nodes_by_id[n] for n in inner.children if doc.nodes_by_id[n].kind=="command"]
+    assert [n.command for n in inner_children]==["LIST","MATERIAL","NIL"]
+    material=inner_children[1]
+    assert _command(doc,material.node_id,"POLY").parent_id==material.node_id
+
+def test_material_dynamic_and_superobj_own_their_expression_arguments():
+    raw=(b"3D VERSION 3.0;\n"
+         b"point: NIL;\n"
+         b"panel: MATERIAL GROUP=2, MIP=\"wall\", point;\n"
+         b"placed: DYNAMIC 0,0,0,0,0,0,1, EXTERN \"stand\";\n"
+         b"root: SUPEROBJ panel, {placed, point};\n")
+    doc=ThreeDFile.from_bytes(raw)
+    material=_command(doc,doc.symbols["panel"][0],"MATERIAL")
+    assert [doc.nodes_by_id[n].name for n in material.children if doc.nodes_by_id[n].kind=="reference"]==["point"]
+    dynamic=_command(doc,doc.symbols["placed"][0],"DYNAMIC")
+    assert _command(doc,dynamic.node_id,"EXTERN").parent_id==dynamic.node_id
+    superobj=_command(doc,doc.symbols["root"][0],"SUPEROBJ")
+    assert [doc.nodes_by_id[n].kind for n in superobj.children]==["reference","superobj-items"]
+    items=doc.nodes_by_id[superobj.children[1]]
+    assert [doc.nodes_by_id[n].name for n in items.children]==["placed","point"]
+
+def test_collection_and_switch_groups_have_specific_structural_kinds():
+    raw=(b"3D VERSION 3.0;\n"
+         b"a: NIL;\n"
+         b"line: LINE <32> {a,a};\n"
+         b"data: DATA {1,2,3,4};\n"
+         b"dyno: DYNO {1,2,3,4};\n"
+         b"lod: SWITCH DISTANCE ([<0,0,0>]) > {(100 ? NIL), (0 ? a)};\n")
+    doc=ThreeDFile.from_bytes(raw)
+    expected={"line":"line-items","data":"data-values","dyno":"dyno-values"}
+    for definition,kind in expected.items():
+        command=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[doc.symbols[definition][0]].children if doc.nodes_by_id[n].kind=="command")
+        assert any(doc.nodes_by_id[n].kind==kind for n in command.children)
+    switch=_command(doc,doc.symbols["lod"][0],"SWITCH")
+    assert [doc.nodes_by_id[n].kind for n in switch.children]==["switch-origin","switch-cases"]
+    cases=doc.nodes_by_id[switch.children[1]]
+    assert [doc.nodes_by_id[n].kind for n in cases.children]==["switch-case","switch-case"]

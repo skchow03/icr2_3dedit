@@ -12,6 +12,25 @@ from .syntax import COMMANDS, KEYWORDS, RECORD_FIELDS, Token, TokenKind, tokeniz
 
 _OPEN_TO_CLOSE = {"{": "}", "(": ")", "[": "]", "<": ">"}
 _TRIVIA = {TokenKind.WHITESPACE, TokenKind.COMMENT}
+_EXTERNAL_CHILD_ARITY = {
+    "FACE": 1,
+    "FACE2": 2,
+    "BSPF": 3,
+    "BSPA": 3,
+    "BSP2": 4,
+    "BSPN": 2,
+    "MATERIAL": 1,
+    "DYNAMIC": 1,
+}
+_FINAL_GROUP_KIND = {
+    "LIST": "list-items",
+    "POLY": "poly-items",
+    "LINE": "line-items",
+    "SWITCH": "switch-cases",
+    "DYNO": "dyno-values",
+    "DATA": "data-values",
+    "SUPEROBJ": "superobj-items",
+}
 
 @dataclass(frozen=True, slots=True)
 class ThreeDDiagnostic:
@@ -117,6 +136,7 @@ class _Builder:
             if len(ids)>1:
                 node=self.nodes[ids[1]]; self._diag(self.tokens[node.token_start],"duplicate-symbol",f"Duplicate definition {name!r}")
         self._collect_references()
+        self._repair_expression_ownership()
         # References are added after syntax nodes; restore source order for every
         # parent's children so the structural tree remains a faithful source view.
         for node in self.nodes.values():
@@ -130,6 +150,13 @@ class _Builder:
         if opener=="[": return "record"
         if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="LIST": return "list-items"
         if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="POLY": return "poly-items"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="LINE": return "line-items"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="DYNO": return "dyno-values"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="DATA": return "data-values"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="SUPEROBJ": return "superobj-items"
+        if opener=="(" and parent is not None and parent.kind=="command" and parent.command=="SWITCH": return "switch-origin"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="SWITCH": return "switch-cases"
+        if opener=="(" and parent is not None and parent.kind=="switch-cases": return "switch-case"
         if opener=="(" and parent is not None and parent.kind=="command" and parent.command in {"FACE","FACE2","BSPF","BSPN","BSPA","BSP2"}: return "plane"
         return "group"
 
@@ -140,9 +167,8 @@ class _Builder:
             tok=self.tokens[i]; current=stack[-1][0] if stack else definition_id
             if tok.kind is TokenKind.IDENTIFIER and tok.text.upper() in COMMANDS:
                 cmd=tok.text.upper()
-                if cmd not in {"NIL","EXTERN"}:
-                    cid=self._new("command",tok.start,tok.end,current,i,i+1,command=cmd); created.append(cid); active_command=cid
-                else: active_command=None
+                cid=self._new("command",tok.start,tok.end,current,i,i+1,command=cmd); created.append(cid)
+                active_command=None if cmd=="NIL" else cid
                 continue
             if tok.kind in _TRIVIA: continue
             if tok.kind is TokenKind.OPEN:
@@ -159,20 +185,16 @@ class _Builder:
                 gid,_=stack.pop(); g=self.nodes[gid]; g.end=tok.end; g.token_end=i+1; g.closer=tok.text
                 if g.parent_id is not None and self.nodes[g.parent_id].kind=="command":
                     c=self.nodes[g.parent_id]; c.end=tok.end; c.token_end=i+1
-                    # LIST and POLY end with their item group.  Do not let a
-                    # completed nested command claim later siblings in its
-                    # containing source group.
-                    final_group = (
-                        (c.command=="LIST" and g.kind=="list-items")
-                        or (c.command=="POLY" and g.kind=="poly-items")
-                    )
+                    # Commands whose grammar ends in a delimited group must not
+                    # claim later sibling expressions in their source container.
+                    final_group = _FINAL_GROUP_KIND.get(c.command)==g.kind
                     if final_group and active_command==c.node_id:
                         active_command=None
                 continue
             if active_command is not None and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
                 c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
             if tok.kind is TokenKind.COMMA and active_command is not None:
-                if self.nodes[active_command].command not in {"POLY","LIST"} and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
+                if self.nodes[active_command].command not in {"POLY","LIST","SUPEROBJ"} and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
                     active_command=None
 
         # Classify bracket records from their actual contents. TRK23D emits both
@@ -211,6 +233,44 @@ class _Builder:
             for action,nid in events.get(i,[]):
                 if action>0: active.append(nid)
             self.owner_by_token[i]=active[-1] if active else definition_id
+
+    def _repair_expression_ownership(self):
+        """Nest verified prefix-command child expressions without recursion.
+
+        The initial delimiter pass intentionally stays permissive.  At each
+        source container, known prefix commands and their following expressions
+        form a small prefix stream.  Reading that stream from right to left lets
+        us attach fixed-arity children without recursive descent or reference
+        expansion.
+        """
+        for parent_id in tuple(self.nodes):
+            parent=self.nodes[parent_id]
+            expressions=[
+                nid for nid in parent.children
+                if self.nodes[nid].kind in {"command","reference"}
+            ]
+            roots=[]
+            for nid in reversed(expressions):
+                node=self.nodes[nid]
+                arity=_EXTERNAL_CHILD_ARITY.get(node.command or "",0)
+                already_owned=sum(
+                    self.nodes[child_id].kind in {"command","reference"}
+                    for child_id in node.children
+                )
+                missing=max(0,arity-already_owned)
+                if missing and len(roots)>=missing:
+                    adopted=roots[:missing]
+                    for child_id in adopted:
+                        parent.children.remove(child_id)
+                        child=self.nodes[child_id]
+                        child.parent_id=nid
+                        node.children.append(child_id)
+                    last=self.nodes[adopted[-1]]
+                    node.end=max(node.end,last.end)
+                    node.token_end=max(node.token_end,last.token_end)
+                    roots=[nid,*roots[missing:]]
+                else:
+                    roots.insert(0,nid)
 
     def _collect_references(self):
         for did in self.top:
