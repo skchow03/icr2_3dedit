@@ -20,15 +20,39 @@ def test_nested_commands_are_explicit_structural_nodes():
     raw=b"3D VERSION 3.0;\nbar: NIL;\nbaz: NIL;\nfoo: LIST { bar, LIST { baz } };\n"
     doc=ThreeDFile.from_bytes(raw); foo=doc.symbols["foo"][0]
     outer=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[foo].children if doc.nodes_by_id[n].kind=="command" and doc.nodes_by_id[n].command=="LIST")
-    outer_group=next(doc.nodes_by_id[n] for n in outer.children if doc.nodes_by_id[n].kind=="group")
+    outer_group=next(doc.nodes_by_id[n] for n in outer.children if doc.nodes_by_id[n].kind=="list-items")
     inner=next(doc.nodes_by_id[n] for n in outer_group.children if doc.nodes_by_id[n].kind=="command" and doc.nodes_by_id[n].command=="LIST")
-    inner_group=next(doc.nodes_by_id[n] for n in inner.children if doc.nodes_by_id[n].kind=="group")
+    inner_group=next(doc.nodes_by_id[n] for n in inner.children if doc.nodes_by_id[n].kind=="list-items")
     bar_ref=next(doc.nodes_by_id[r.node_id] for r in doc.references if r.name=="bar"); baz_ref=next(doc.nodes_by_id[r.node_id] for r in doc.references if r.name=="baz")
     assert bar_ref.parent_id==outer_group.node_id; assert baz_ref.parent_id==inner_group.node_id; assert doc.to_bytes()==raw
 
 def test_command_nodes_identify_bsp_and_face_constructs():
     raw=b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nc: NIL;\np: FACE2 (a,b,c), a, b;\nroot: BSPN (a,b,c), p, b;\n"
     doc=ThreeDFile.from_bytes(raw); commands={n.command for n in doc.nodes_by_id.values() if n.kind=="command"}; assert {"FACE2","BSPN"}<=commands; assert not doc.diagnostics; assert doc.to_bytes()==raw
+
+def test_inline_point_is_distinct_from_named_definition():
+    raw=b"3D VERSION 3.0;\nnamed: [<1,2,3>];\nface: FACE ([<4,5,6>], [<7,8,9>], named), named;\n"
+    doc=ThreeDFile.from_bytes(raw)
+    assert "named" in doc.symbols
+    inline=[n for n in doc.nodes_by_id.values() if n.kind=="inline-point"]
+    assert len(inline)==3
+    assert all(n.name is None for n in inline)
+    assert doc.to_bytes()==raw
+
+def test_poly_owns_all_of_its_argument_groups():
+    raw=b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nc: NIL;\np: POLY [T] <2> {a,b,c};\n"
+    doc=ThreeDFile.from_bytes(raw); p=doc.symbols["p"][0]
+    poly=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[p].children if doc.nodes_by_id[n].kind=="command" and doc.nodes_by_id[n].command=="POLY")
+    child_kinds=[doc.nodes_by_id[n].kind for n in poly.children]
+    assert child_kinds==["record","tuple","poly-items"]
+    assert {r.name for r in doc.references if doc.nodes_by_id[r.node_id].parent_id in poly.children}=={"a","b","c"}
+    assert doc.to_bytes()==raw
+
+def test_polygon_is_not_a_reserved_command_alias():
+    doc=ThreeDFile.from_bytes(b"3D VERSION 3.0;\nPOLYGON: NIL;\nroot: LIST { POLYGON };\n")
+    assert "POLYGON" in doc.symbols
+    ref=next(r for r in doc.references if r.name=="POLYGON")
+    assert ref.target_node_id==doc.symbols["POLYGON"][0]
 
 def test_forward_reference_resolves_without_expansion():
     doc=ThreeDFile.from_bytes(b"3D VERSION 3.0;\nfoo: LIST { later };\nlater: NIL;\n"); ref=next(r for r in doc.references if r.name=="later"); assert ref.target_node_id==doc.symbols["later"][0]; assert doc.nodes_by_id[ref.node_id].kind=="reference"
