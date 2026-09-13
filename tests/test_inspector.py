@@ -145,6 +145,33 @@ def test_coordinate_properties_expose_exact_component_spellings():
     assert properties["Z"] == "3e2"
 
 
+def test_inspector_search_returns_capped_structural_rows_without_tree_expansion():
+    definitions = "\n".join(f"point_{index}: NIL;" for index in range(20))
+    document = ThreeDFile.from_bytes(
+        f"3D VERSION 3.0;\n{definitions}\nroot: LIST {{ point_3, point_13 }};\n".encode()
+    )
+    model = ThreeDInspectorModel(document)
+
+    results = model.search("point_1", kind_filter="Definitions", limit=3)
+
+    assert len(results) == 3
+    assert all(document.nodes_by_id[result.node_id].kind == "definition" for result in results)
+    assert [result.label for result in results] == ["point_1", "point_10", "point_11"]
+
+
+def test_inspector_search_can_find_references_by_target_name():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\nfinish_line: NIL;\nroot: LIST { finish_line };\n"
+    )
+    model = ThreeDInspectorModel(document)
+
+    results = model.search("finish", kind_filter="References")
+
+    assert len(results) == 1
+    assert results[0].kind == "reference"
+    assert results[0].detail == "targets finish_line"
+
+
 def test_named_textured_vertex_exposes_xyzuv_without_coordinate_drilldown():
     document = ThreeDFile.from_bytes(
         b"3D VERSION 3.0;\nvertex: [<+1, 2, 3>, T=<4, 5>];\n"
