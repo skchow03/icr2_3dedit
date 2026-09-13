@@ -12,7 +12,12 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 from .editing import ThreeDEditSession
-from .inspector import TREE_CHILD_BATCH, ThreeDInspectorModel
+from .inspector import (
+    SEARCH_RESULT_LIMIT,
+    TREE_CHILD_BATCH,
+    InspectorSearchResult,
+    ThreeDInspectorModel,
+)
 from .parser import Statement
 from .threedfile import ThreeDDiagnostic, ThreeDFile
 from .values import (
@@ -24,6 +29,7 @@ from .values import (
 
 LOGGER = logging.getLogger(__name__)
 OUTLINE_KINDS = ("All", "Vertex", "POLY", "LIST", "BSPF", "DYNAMIC", "SUPEROBJ", "Other")
+SEARCH_KINDS = ("All", "Definitions", "Commands", "References", "Editable Values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +304,7 @@ class EditorWindow(tk.Tk):
         self._source_page_index = 0
         self._reference_rows = ()
         self._reverse_rows = ()
+        self._search_rows: tuple[InspectorSearchResult, ...] = ()
         self._diagnostic_by_item: dict[str, ThreeDDiagnostic] = {}
         self._navigation_back: list[StructuralSelectionAnchor] = []
         self._navigation_forward: list[StructuralSelectionAnchor] = []
@@ -356,6 +363,7 @@ class EditorWindow(tk.Tk):
         self.bind_all("<Control-z>", lambda _event: self.undo())
         self.bind_all("<Control-y>", lambda _event: self.redo())
         self.bind_all("<Control-e>", lambda _event: self.edit_selected_values())
+        self.bind_all("<Control-f>", lambda _event: self.focus_search())
         self.bind_all("<Alt-Left>", lambda _event: self.navigate_back())
         self.bind_all("<Alt-Right>", lambda _event: self.navigate_forward())
         self.bind_all("<F2>", lambda _event: self.rename_selected_definition())
@@ -382,6 +390,45 @@ class EditorWindow(tk.Tk):
             structure_header, text="◀", width=3, command=self.navigate_back
         )
         self.back_button.pack(side=tk.RIGHT, padx=(0, 3))
+        search_frame = ttk.Frame(structure_frame)
+        search_frame.pack(fill=tk.X, pady=(5, 0))
+        self.search_text = tk.StringVar()
+        self.search_kind = tk.StringVar(value="All")
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_text)
+        self.search_entry.grid(row=0, column=0, sticky="ew")
+        self.search_entry.bind("<Return>", lambda _event: self.run_search())
+        self.search_entry.bind("<Escape>", lambda _event: self.clear_search())
+        self.search_kind_menu = ttk.OptionMenu(
+            search_frame,
+            self.search_kind,
+            "All",
+            *SEARCH_KINDS[1:],
+            command=lambda _value: self.run_search(),
+        )
+        self.search_kind_menu.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.search_button = ttk.Button(
+            search_frame, text="Find", width=6, command=self.run_search
+        )
+        self.search_button.grid(row=0, column=2, padx=(4, 0))
+        search_frame.columnconfigure(0, weight=1)
+        self.search_results = ttk.Treeview(
+            structure_frame,
+            columns=("kind", "line", "node"),
+            show="tree headings",
+            height=6,
+            selectmode="browse",
+        )
+        self.search_results.heading("#0", text="Find results")
+        self.search_results.heading("kind", text="Kind")
+        self.search_results.heading("line", text="Line")
+        self.search_results.heading("node", text="NodeID")
+        self.search_results.column("#0", width=210)
+        self.search_results.column("kind", width=95, stretch=False)
+        self.search_results.column("line", width=55, stretch=False)
+        self.search_results.column("node", width=70, stretch=False)
+        self.search_results.pack(fill=tk.X, pady=(4, 0))
+        self.search_results.bind("<Double-1>", self._search_result_activated)
+        self.search_results.bind("<Return>", self._search_result_activated)
         tree_frame = ttk.Frame(structure_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self.structure = ttk.Treeview(
@@ -455,9 +502,13 @@ class EditorWindow(tk.Tk):
         self.references = tk.Listbox(references_tab, activestyle="dotbox")
         self.references.pack(fill=tk.BOTH, expand=True)
         self.references.bind("<Double-1>", self._reference_activated)
+        self.references.bind("<<ListboxSelect>>", lambda _event: self._update_command_states())
+        self.references.bind("<FocusIn>", lambda _event: self._update_command_states())
         self.reverse_references = tk.Listbox(reverse_tab, activestyle="dotbox")
         self.reverse_references.pack(fill=tk.BOTH, expand=True)
         self.reverse_references.bind("<Double-1>", self._reverse_reference_activated)
+        self.reverse_references.bind("<<ListboxSelect>>", lambda _event: self._update_command_states())
+        self.reverse_references.bind("<FocusIn>", lambda _event: self._update_command_states())
 
         self.diagnostics = ttk.Treeview(
             diagnostics_tab,
@@ -607,6 +658,12 @@ class EditorWindow(tk.Tk):
         roots = self.structure.get_children("")
         if roots:
             self.structure.delete(*roots)
+        search_rows = self.search_results.get_children("")
+        if search_rows:
+            self.search_results.delete(*search_rows)
+        self._search_rows = ()
+        self.search_text.set("")
+        self.search_kind.set("All")
         for tree in (self.properties, self.diagnostics):
             rows = tree.get_children("")
             if rows:
@@ -623,6 +680,62 @@ class EditorWindow(tk.Tk):
         self._navigation_back.clear()
         self._navigation_forward.clear()
         self._update_command_states()
+
+    def focus_search(self) -> None:
+        if hasattr(self, "search_entry"):
+            self.search_entry.focus_set()
+            self.search_entry.selection_range(0, tk.END)
+
+    def clear_search(self) -> None:
+        self.search_text.set("")
+        rows = self.search_results.get_children("")
+        if rows:
+            self.search_results.delete(*rows)
+        self._search_rows = ()
+        self._update_command_states()
+
+    def run_search(self) -> None:
+        if self.model is None or self._busy:
+            return
+        rows = self.search_results.get_children("")
+        if rows:
+            self.search_results.delete(*rows)
+        query = self.search_text.get()
+        self._search_rows = self.model.search(
+            query,
+            kind_filter=self.search_kind.get(),
+            limit=SEARCH_RESULT_LIMIT,
+        )
+        for index, result in enumerate(self._search_rows):
+            detail = f" — {result.detail}" if result.detail else ""
+            self.search_results.insert(
+                "",
+                tk.END,
+                iid=f"search:{index}",
+                text=f"{result.label}{detail}",
+                values=(result.kind, result.line, result.node_id),
+            )
+        if query.strip() and not self._search_rows:
+            self.search_results.insert("", tk.END, iid="search:none", text="No matches")
+        elif len(self._search_rows) >= SEARCH_RESULT_LIMIT:
+            self.search_results.insert(
+                "",
+                tk.END,
+                iid="search:limit",
+                text=f"Showing first {SEARCH_RESULT_LIMIT:,} matches; narrow the search.",
+            )
+        self._update_command_states()
+
+    def _search_result_activated(self, _event: tk.Event) -> None:
+        selected = self.search_results.selection()
+        if not selected or not selected[0].startswith("search:"):
+            return
+        index_text = selected[0].split(":", 1)[1]
+        if not index_text.isdigit():
+            return
+        index = int(index_text)
+        if index < len(self._search_rows):
+            self.navigate_to(self._search_rows[index].node_id)
 
     def _tree_opened(self, _event: tk.Event) -> None:
         if self.lazy_tree is not None:
@@ -772,15 +885,13 @@ class EditorWindow(tk.Tk):
             self.navigate_to(self._reverse_rows[selected[0]].node_id)
 
     def follow_selected_reference(self) -> bool:
-        if self.model is None or self._selected_node_id is None:
+        target = self._active_follow_target_node_id()
+        if target is None:
             return False
-        reference = self.model.reference_for_node(self._selected_node_id)
-        if reference is None:
-            return False
-        if reference.target_node_id is None:
+        if target == self._selected_node_id:
             self.bell()
             return True
-        self.navigate_to(reference.target_node_id)
+        self.navigate_to(target)
         return True
 
     def _show_node_source(self) -> None:
@@ -991,6 +1102,11 @@ class EditorWindow(tk.Tk):
         if not hasattr(self, "file_menu"):
             return
         has_document = self.session is not None and not self._busy
+        if hasattr(self, "search_entry"):
+            search_state = tk.NORMAL if has_document else tk.DISABLED
+            self.search_entry.configure(state=search_state)
+            self.search_button.configure(state=search_state)
+            self.search_kind_menu.configure(state=search_state)
         self.file_menu.entryconfigure(
             "Open…", state=tk.DISABLED if self._busy else tk.NORMAL
         )
@@ -1029,12 +1145,7 @@ class EditorWindow(tk.Tk):
             "Forward",
             state=tk.NORMAL if self._navigation_forward and has_document else tk.DISABLED,
         )
-        can_follow = (
-            has_document
-            and self.model is not None
-            and self._selected_node_id is not None
-            and self.model.reference_for_node(self._selected_node_id) is not None
-        )
+        can_follow = has_document and self._active_follow_target_node_id() is not None
         self.navigate_menu.entryconfigure(
             "Follow Reference", state=tk.NORMAL if can_follow else tk.DISABLED
         )
@@ -1049,6 +1160,24 @@ class EditorWindow(tk.Tk):
         if hasattr(self, "tree_menu"):
             self.tree_menu.entryconfigure("Rename Definition…", state=rename_state)
             self.tree_menu.entryconfigure("Edit Values…", state=values_state)
+
+    def _active_follow_target_node_id(self) -> int | None:
+        if self.model is None or self._selected_node_id is None:
+            return None
+        focused = self.focus_get() if hasattr(self, "focus_get") else None
+        if focused is self.references:
+            selected = self.references.curselection()
+            if selected and selected[0] < len(self._reference_rows):
+                ref = self._reference_rows[selected[0]]
+                return ref.target_node_id if ref.target_node_id is not None else ref.node_id
+        if focused is self.reverse_references:
+            selected = self.reverse_references.curselection()
+            if selected and selected[0] < len(self._reverse_rows):
+                return self._reverse_rows[selected[0]].node_id
+        reference = self.model.reference_for_node(self._selected_node_id)
+        if reference is not None:
+            return reference.target_node_id if reference.target_node_id is not None else reference.node_id
+        return None
 
     def _update_title(self) -> None:
         title = "ICR2 3D Document Inspector"
