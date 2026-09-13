@@ -95,6 +95,21 @@ def test_large_node_source_is_paged_into_bounded_exact_slices():
     assert "".join(page.text for page in pages) == document.node_text(root)
 
 
+def test_coordinate_properties_expose_exact_component_spellings():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\npoint: [<+1.000, -.25, 3e2>];\n"
+    )
+    model = ThreeDInspectorModel(document)
+    coordinate_id = next(
+        node.node_id for node in document.nodes_by_id.values()
+        if node.kind == "coordinate"
+    )
+    properties = dict(model.properties(coordinate_id))
+    assert properties["X"] == "+1.000"
+    assert properties["Y"] == "-.25"
+    assert properties["Z"] == "3e2"
+
+
 def test_tree_initially_materializes_only_top_level_structural_nodes():
     document = ThreeDFile.from_bytes(
         b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nroot: LIST { a, LIST { b } };\n"

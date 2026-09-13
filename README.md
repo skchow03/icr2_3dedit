@@ -1,8 +1,8 @@
 # ICR2 3D Editor
 
 An early, structure-aware editor for the textual Papyrus `.3D` format used by
-IndyCar Racing II tools. The current milestone is a read-only document inspector
-for the lossless `ThreeDFile` source model rather than a CAD program.
+IndyCar Racing II tools. The current milestone is a minimally editable document
+inspector for the lossless `ThreeDFile` source model rather than a CAD program.
 
 ## Current features
 
@@ -23,6 +23,8 @@ for the lossless `ThreeDFile` source model rather than a CAD program.
 - Command-based undo/redo for committed edit transactions
 - Definition renaming that updates references resolved to that exact definition
 - Inspector commands for F2/context-menu rename, Save, Save As, undo, and redo
+- Structured X/Y/Z and U/V editing for coordinate and texcoord nodes via
+  **Edit Values…** (Ctrl+E), replacing only the selected number tokens
 - Background document rebuilding after edits, with renamed-selection restoration
 - Dirty-title indication and save/discard/cancel prompting for unsaved changes
 - No geometry construction, BSP interpretation, rendering, or Papyrus traversal
@@ -36,8 +38,8 @@ reconstruction as proof that every command's semantics are understood.
 
 ## Known limitations
 
-- GUI editing is currently limited to renaming named definitions. Other
-  structural and property edits are not yet implemented.
+- GUI editing currently covers named-definition renaming and numeric coordinate
+  tuples. Other structural and property edits are not yet implemented.
 - Command semantics, geometry caches, and Papyrus-compatible traversal are not
   implemented.
 - There is no graphical model preview or OpenGL integration.

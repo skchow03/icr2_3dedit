@@ -5,6 +5,7 @@ import pytest
 from icr2_3dedit.editing import ThreeDEditSession
 from icr2_3dedit.serializer import ThreeDSerializer, ThreeDSourceEdit
 from icr2_3dedit.threedfile import ThreeDFile
+from icr2_3dedit.values import numeric_tuple, validate_numeric_literal
 
 
 def test_serializer_copies_untouched_source_and_builds_inverse_edits():
@@ -71,6 +72,72 @@ def test_new_edit_after_undo_discards_redo_history():
     session.rename_definition(session.document.symbols["a"][0], "second")
     assert not session.can_redo
     assert b"second" in session.document.to_bytes()
+
+
+def test_numeric_tuple_edit_replaces_only_number_tokens_as_one_command():
+    raw = (
+        b"3D VERSION 3.0;\r\n"
+        b"point:\t[<+1.000,  -2, 3e2>]; % exact formatting\r\n"
+    )
+    session = ThreeDEditSession(ThreeDFile.from_bytes(raw))
+    coordinate_id = next(
+        node.node_id for node in session.document.nodes_by_id.values()
+        if node.kind == "coordinate"
+    )
+    returned_id = session.edit_numeric_tuple(
+        coordinate_id, ("+1.000", "-22.50", ".75")
+    )
+
+    assert returned_id == coordinate_id
+    assert session.document.to_bytes() == raw.replace(b"-2", b"-22.50").replace(b"3e2", b".75")
+    assert session.undo_description == "Edit coordinate values"
+    session.undo()
+    assert session.document.to_bytes() == raw
+    session.redo()
+    assert b"[<+1.000,  -22.50, .75>]" in session.document.to_bytes()
+
+
+def test_numeric_tuple_noop_does_not_create_history():
+    session = ThreeDEditSession(
+        ThreeDFile.from_bytes(b"3D VERSION 3.0;\npoint: [<1, 2, 3>];\n")
+    )
+    coordinate_id = next(
+        node.node_id for node in session.document.nodes_by_id.values()
+        if node.kind == "coordinate"
+    )
+    editable = numeric_tuple(session.document, coordinate_id)
+    assert editable is not None
+    session.edit_numeric_tuple(coordinate_id, editable.spellings)
+    assert not session.can_undo
+    assert not session.document.dirty
+
+
+@pytest.mark.parametrize("valid", ["0", "+1", "-2", ".5", "1.", "-3.25e+4"])
+def test_numeric_literal_validation_accepts_lexer_numbers(valid: str):
+    validate_numeric_literal(valid)
+
+
+@pytest.mark.parametrize("invalid", ["", " 1", "1 ", "1,2", "NaN", "inf", "--1"])
+def test_numeric_literal_validation_rejects_non_number_tokens(invalid: str):
+    with pytest.raises(ValueError, match="valid .3D number"):
+        validate_numeric_literal(invalid)
+
+
+def test_numeric_tuple_edit_rejects_wrong_node_shape_arity_and_values():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\npoint: [<1,2,3>];\nroot: LIST { point };\n"
+    )
+    session = ThreeDEditSession(document)
+    coordinate_id = next(
+        node.node_id for node in document.nodes_by_id.values()
+        if node.kind == "coordinate"
+    )
+    with pytest.raises(ValueError, match="requires 3"):
+        session.edit_numeric_tuple(coordinate_id, ("1", "2"))
+    with pytest.raises(ValueError, match="valid .3D number"):
+        session.edit_numeric_tuple(coordinate_id, ("1", "two", "3"))
+    with pytest.raises(ValueError, match="coordinate or texcoord"):
+        session.edit_numeric_tuple(document.symbols["root"][0], ("1", "2"))
 
 
 def test_rename_rejects_invalid_reserved_duplicate_and_non_definition_names():
@@ -147,3 +214,39 @@ def test_real_fixture_localized_rename_saves_and_reopens_losslessly(
     assert new_name in reopened.symbols
     assert target.name not in reopened.symbols
     assert all(ref.name != target.name for ref in reopened.references)
+
+
+def test_reno_inline_textured_coordinate_edit_undo_redo_save_and_reopen(tmp_path: Path):
+    path = Path(__file__).parent / "fixtures" / "RENO.3D"
+    raw = path.read_bytes()
+    session = ThreeDEditSession(ThreeDFile.from_bytes(raw))
+    textured = next(
+        node for node in session.document.nodes_by_id.values()
+        if node.kind == "textured-vertex"
+    )
+    coordinate_id = next(
+        child_id for child_id in textured.children
+        if session.document.nodes_by_id[child_id].kind == "coordinate"
+    )
+    editable = numeric_tuple(session.document, coordinate_id)
+    assert editable is not None
+    replacement_y = str(int(editable.spellings[1]) + 1)
+    expected_text = (
+        session.document.source_text[:editable.components[1].start]
+        + replacement_y
+        + session.document.source_text[editable.components[1].end:]
+    )
+
+    session.edit_numeric_tuple(
+        coordinate_id,
+        (editable.spellings[0], replacement_y, editable.spellings[2]),
+    )
+    assert session.document.source_text == expected_text
+    session.undo()
+    assert session.document.to_bytes() == raw
+    session.redo()
+    assert session.document.source_text == expected_text
+
+    destination = tmp_path / "RENO-edited.3D"
+    session.save(destination)
+    assert ThreeDFile.load(destination).to_bytes() == session.document.to_bytes()
