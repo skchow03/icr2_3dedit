@@ -15,7 +15,7 @@ import re
 # by the community format notes. Keep these separate from user-defined pointer
 # names so the structural reference pass never diagnoses commands as symbols.
 COMMANDS = frozenset({
-    "NIL", "FACE", "FACE2", "POLY", "POLYGON", "LINE", "LIST",
+    "NIL", "FACE", "FACE2", "POLY", "LINE", "LIST",
     "BSPF", "BSPN", "BSPA", "BSP2",
     "MATERIAL", "DYNAMIC", "DYNO", "SUPEROBJ", "SWITCH", "DATA", "EXTERN",
 })
