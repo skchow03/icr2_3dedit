@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from .document import atomic_write
 from .serializer import ThreeDSerializer, ThreeDSourceEdit
 from .syntax import RESERVED_WORDS, TokenKind, tokenize
 from .threedfile import ThreeDFile
-from .values import numeric_tuple, validate_numeric_literal
+from .values import (
+    ThreeDNumericComponent,
+    editable_values,
+    numeric_tuple,
+    validate_numeric_literal,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,23 +139,43 @@ class ThreeDEditSession:
         editable = numeric_tuple(self.document, node_id)
         if editable is None:
             raise ValueError("node_id must identify a valid coordinate or texcoord")
-        replacements = tuple(values)
-        if len(replacements) != len(editable.components):
-            raise ValueError(
-                f"{editable.kind} requires {len(editable.components)} values"
-            )
-        for replacement in replacements:
-            validate_numeric_literal(replacement)
-        edits = tuple(
-            ThreeDSourceEdit(component.start, component.end, replacement)
-            for component, replacement in zip(editable.components, replacements)
-            if replacement != component.spelling
+        self._edit_components(
+            editable.components, values, f"Edit {editable.kind} values"
         )
-        self.execute(f"Edit {editable.kind} values", edits)
         reparsed = numeric_tuple(self.document, node_id)
         if reparsed is None:
             raise RuntimeError("edited numeric tuple did not reparse at its source location")
         return reparsed.node_id
+
+    def edit_numeric_values(self, node_id: int, values: Iterable[str]) -> int:
+        """Edit values projected onto a point, textured vertex, or definition."""
+        editable = editable_values(self.document, node_id)
+        if editable is None:
+            raise ValueError("node_id does not expose editable numeric values")
+        self._edit_components(
+            editable.components, values, f"Edit {editable.kind} values"
+        )
+        if editable_values(self.document, node_id) is None:
+            raise RuntimeError("edited values did not reparse at their source location")
+        return node_id
+
+    def _edit_components(
+        self,
+        components: Sequence[ThreeDNumericComponent],
+        values: Iterable[str],
+        description: str,
+    ) -> None:
+        replacements = tuple(values)
+        if len(replacements) != len(components):
+            raise ValueError(f"selected object requires {len(components)} values")
+        for replacement in replacements:
+            validate_numeric_literal(replacement)
+        edits = tuple(
+            ThreeDSourceEdit(component.start, component.end, replacement)
+            for component, replacement in zip(components, replacements)
+            if replacement != component.spelling
+        )
+        self.execute(description, edits)
 
     def save(self, path: str | Path | None = None) -> Path:
         destination = Path(path) if path is not None else self.document.path

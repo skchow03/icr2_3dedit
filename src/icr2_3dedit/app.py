@@ -15,7 +15,11 @@ from .editing import ThreeDEditSession
 from .inspector import TREE_CHILD_BATCH, ThreeDInspectorModel
 from .parser import Statement
 from .threedfile import ThreeDDiagnostic, ThreeDFile
-from .values import ThreeDNumericTuple, numeric_tuple, validate_numeric_literal
+from .values import (
+    ThreeDEditableValues,
+    editable_values,
+    validate_numeric_literal,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,11 +37,16 @@ class StructuralSelectionAnchor:
 class NumericTupleDialog(simpledialog.Dialog):
     """Small modal editor that keeps numeric spelling under user control."""
 
-    def __init__(self, parent: tk.Misc, editable: ThreeDNumericTuple) -> None:
+    def __init__(self, parent: tk.Misc, editable: ThreeDEditableValues) -> None:
         self.editable = editable
         self.entries: list[ttk.Entry] = []
         self.result: tuple[str, ...] | None = None
-        label = "coordinate" if editable.kind == "coordinate" else "texture coordinate"
+        label = {
+            "coordinate": "coordinate",
+            "texcoord": "texture coordinate",
+            "inline-point": "point",
+            "textured-vertex": "textured vertex",
+        }.get(editable.kind, "values")
         super().__init__(parent, f"Edit {label}")
 
     def body(self, master: tk.Misc) -> tk.Widget | None:
@@ -166,6 +175,8 @@ class LazyStructureTree:
         node = self.model.node(node_id)
         line, _ = self.model.line_and_column(node_id)
         item = self.node_item(node_id)
+        if self.tree.exists(item):
+            return item
         self.tree.insert(
             parent_item,
             tk.END,
@@ -231,6 +242,42 @@ class LazyStructureTree:
             self.tree.selection_set(item)
         self.tree.see(item)
 
+    def reveal_node(self, node_id: int) -> None:
+        """Materialize only the ancestor path needed to reveal one NodeID."""
+        if node_id not in self.model.document.nodes_by_id:
+            return
+        path: list[int] = []
+        current_id: int | None = node_id
+        while current_id is not None:
+            path.append(current_id)
+            current_id = self.model.node(current_id).parent_id
+        path.reverse()
+        if not path or not self.tree.exists(self.node_item(path[0])):
+            return
+        for parent_id, child_id in zip(path, path[1:]):
+            parent_item = self.node_item(parent_id)
+            child_item = self.node_item(child_id)
+            placeholder = f"placeholder:{parent_id}"
+            if self.tree.exists(placeholder):
+                self.tree.delete(placeholder)
+            if not self.tree.exists(child_item):
+                self._insert_node(parent_item, child_id)
+            if len(self.model.children(parent_id)) > 1:
+                more_item = f"more:{parent_id}:0"
+                if not self.tree.exists(more_item):
+                    remaining = len(self.model.children(parent_id)) - 1
+                    self.tree.insert(
+                        parent_item,
+                        tk.END,
+                        iid=more_item,
+                        text=f"Load other children… ({remaining} not shown)",
+                        values=("", "", ""),
+                        tags=(self.MORE_TAG,),
+                    )
+                    self._more[more_item] = (parent_id, 0)
+            self.tree.item(parent_item, open=True)
+        self.select_node(node_id)
+
 
 class EditorWindow(tk.Tk):
     """Lazy structural browser and command-based editor for ThreeDFile."""
@@ -252,6 +299,8 @@ class EditorWindow(tk.Tk):
         self._reference_rows = ()
         self._reverse_rows = ()
         self._diagnostic_by_item: dict[str, ThreeDDiagnostic] = {}
+        self._navigation_back: list[StructuralSelectionAnchor] = []
+        self._navigation_forward: list[StructuralSelectionAnchor] = []
         self._busy = False
         self._closing = False
 
@@ -286,6 +335,20 @@ class EditorWindow(tk.Tk):
             command=self.edit_selected_values,
         )
         menu.add_cascade(label="Edit", menu=self.edit_menu)
+
+        self.navigate_menu = tk.Menu(menu, tearoff=False)
+        self.navigate_menu.add_command(
+            label="Back", accelerator="Alt+Left", command=self.navigate_back
+        )
+        self.navigate_menu.add_command(
+            label="Forward", accelerator="Alt+Right", command=self.navigate_forward
+        )
+        self.navigate_menu.add_separator()
+        self.navigate_menu.add_command(
+            label="Follow Reference", accelerator="Enter",
+            command=self.follow_selected_reference,
+        )
+        menu.add_cascade(label="Navigate", menu=self.navigate_menu)
         self.config(menu=menu)
         self.bind_all("<Control-o>", lambda _event: self.open_file())
         self.bind_all("<Control-s>", lambda _event: self.save_file())
@@ -293,6 +356,8 @@ class EditorWindow(tk.Tk):
         self.bind_all("<Control-z>", lambda _event: self.undo())
         self.bind_all("<Control-y>", lambda _event: self.redo())
         self.bind_all("<Control-e>", lambda _event: self.edit_selected_values())
+        self.bind_all("<Alt-Left>", lambda _event: self.navigate_back())
+        self.bind_all("<Alt-Right>", lambda _event: self.navigate_forward())
         self.bind_all("<F2>", lambda _event: self.rename_selected_definition())
 
     def _build_ui(self) -> None:
@@ -304,7 +369,19 @@ class EditorWindow(tk.Tk):
         outer.add(structure_frame, weight=2)
         outer.add(detail_frame, weight=5)
 
-        ttk.Label(structure_frame, text="Definition / structure explorer").pack(anchor=tk.W)
+        structure_header = ttk.Frame(structure_frame)
+        structure_header.pack(fill=tk.X)
+        ttk.Label(structure_header, text="Definition / structure explorer").pack(
+            side=tk.LEFT
+        )
+        self.forward_button = ttk.Button(
+            structure_header, text="▶", width=3, command=self.navigate_forward
+        )
+        self.forward_button.pack(side=tk.RIGHT)
+        self.back_button = ttk.Button(
+            structure_header, text="◀", width=3, command=self.navigate_back
+        )
+        self.back_button.pack(side=tk.RIGHT, padx=(0, 3))
         tree_frame = ttk.Frame(structure_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
         self.structure = ttk.Treeview(
@@ -367,6 +444,13 @@ class EditorWindow(tk.Tk):
         self.properties.heading("value", text="Value")
         self.properties.column("#0", width=155, stretch=False)
         self.properties.pack(fill=tk.BOTH, expand=True)
+        self.properties.bind("<Double-1>", self._property_activated)
+        property_actions = ttk.Frame(properties_tab)
+        property_actions.pack(fill=tk.X, pady=(6, 0))
+        self.edit_values_button = ttk.Button(
+            property_actions, text="Edit Values…", command=self.edit_selected_values
+        )
+        self.edit_values_button.pack(side=tk.RIGHT)
 
         self.references = tk.Listbox(references_tab, activestyle="dotbox")
         self.references.pack(fill=tk.BOTH, expand=True)
@@ -503,13 +587,10 @@ class EditorWindow(tk.Tk):
         self._populate_diagnostics()
         self._set_busy(False)
         if selected_node_id is not None:
-            # Only roots exist as GUI rows after a rebuild. If an undo/redo was
-            # invoked while inspecting a descendant, select its owning
-            # definition instead of eagerly recreating the expanded path.
-            visible_node_id = selected_node_id
-            while self.document.nodes_by_id[visible_node_id].parent_id is not None:
-                visible_node_id = self.document.nodes_by_id[visible_node_id].parent_id
-            self.inspect_node(visible_node_id)
+            # Restore only this node's ancestor path. This retains the logical
+            # selection without repopulating any unrelated subtree.
+            self.lazy_tree.reveal_node(selected_node_id)
+            self.inspect_node(selected_node_id)
         self.status.configure(
             text=(
                 f"{len(document.top_level_nodes):,} definitions · "
@@ -539,6 +620,8 @@ class EditorWindow(tk.Tk):
         self.model = None
         self.lazy_tree = None
         self._selected_node_id = None
+        self._navigation_back.clear()
+        self._navigation_forward.clear()
         self._update_command_states()
 
     def _tree_opened(self, _event: tk.Event) -> None:
@@ -553,15 +636,23 @@ class EditorWindow(tk.Tk):
         if self.lazy_tree.load_more(item):
             return
         if item.startswith("node:"):
-            self.inspect_node(int(item.split(":", 1)[1]))
+            self.navigate_to(int(item.split(":", 1)[1]))
         self._update_command_states()
 
     def _tree_double_clicked(self, event: tk.Event) -> None:
         item = self.structure.identify_row(event.y)
         if item and self.lazy_tree is not None:
+            if item.startswith("node:"):
+                node_id = int(item.split(":", 1)[1])
+                reference = self.model.reference_for_node(node_id) if self.model else None
+                if reference is not None:
+                    self.follow_selected_reference()
+                    return
             self.lazy_tree.load_more(item)
 
     def _tree_activate(self, _event: tk.Event) -> None:
+        if self.follow_selected_reference():
+            return
         selected = self.structure.selection()
         if selected and self.lazy_tree is not None:
             self.lazy_tree.load_more(selected[0])
@@ -572,7 +663,7 @@ class EditorWindow(tk.Tk):
             return
         self.structure.selection_set(item)
         self.structure.focus(item)
-        self.inspect_node(int(item.split(":", 1)[1]))
+        self.navigate_to(int(item.split(":", 1)[1]))
         try:
             self.tree_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -595,6 +686,43 @@ class EditorWindow(tk.Tk):
         self.lazy_tree.select_node(node_id)
         self._update_command_states()
 
+    def navigate_to(self, node_id: int, record_history: bool = True) -> None:
+        """Select one source node, optionally recording browser-style history."""
+        if self.document is None or self.lazy_tree is None:
+            return
+        if node_id not in self.document.nodes_by_id or node_id == self._selected_node_id:
+            return
+        if record_history:
+            current = capture_selection_anchor(self.document, self._selected_node_id)
+            if current is not None:
+                self._navigation_back.append(current)
+            self._navigation_forward.clear()
+        self.lazy_tree.reveal_node(node_id)
+        self.inspect_node(node_id)
+
+    def navigate_back(self) -> None:
+        self._navigate_history(self._navigation_back, self._navigation_forward)
+
+    def navigate_forward(self) -> None:
+        self._navigate_history(self._navigation_forward, self._navigation_back)
+
+    def _navigate_history(
+        self,
+        source: list[StructuralSelectionAnchor],
+        destination: list[StructuralSelectionAnchor],
+    ) -> None:
+        if self.document is None or not source:
+            return
+        current = capture_selection_anchor(self.document, self._selected_node_id)
+        while source:
+            target = resolve_selection_anchor(self.document, source.pop())
+            if target is not None and target != self._selected_node_id:
+                if current is not None:
+                    destination.append(current)
+                self.navigate_to(target, record_history=False)
+                return
+        self._update_command_states()
+
     def _populate_properties(self, node_id: int) -> None:
         rows = self.properties.get_children("")
         if rows:
@@ -602,6 +730,11 @@ class EditorWindow(tk.Tk):
         assert self.model is not None
         for key, value in self.model.properties(node_id):
             self.properties.insert("", tk.END, text=key, values=(value,))
+
+    def _property_activated(self, event: tk.Event) -> None:
+        item = self.properties.identify_row(event.y)
+        if item and self.properties.item(item, "text") in {"X", "Y", "Z", "U", "V"}:
+            self.edit_selected_values()
 
     def _populate_references(self, node_id: int) -> None:
         assert self.model is not None
@@ -631,12 +764,24 @@ class EditorWindow(tk.Tk):
         if not selected or selected[0] >= len(self._reference_rows):
             return
         ref = self._reference_rows[selected[0]]
-        self.inspect_node(ref.target_node_id if ref.target_node_id is not None else ref.node_id)
+        self.navigate_to(ref.target_node_id if ref.target_node_id is not None else ref.node_id)
 
     def _reverse_reference_activated(self, _event: tk.Event) -> None:
         selected = self.reverse_references.curselection()
         if selected and selected[0] < len(self._reverse_rows):
-            self.inspect_node(self._reverse_rows[selected[0]].node_id)
+            self.navigate_to(self._reverse_rows[selected[0]].node_id)
+
+    def follow_selected_reference(self) -> bool:
+        if self.model is None or self._selected_node_id is None:
+            return False
+        reference = self.model.reference_for_node(self._selected_node_id)
+        if reference is None:
+            return False
+        if reference.target_node_id is None:
+            self.bell()
+            return True
+        self.navigate_to(reference.target_node_id)
+        return True
 
     def _show_node_source(self) -> None:
         if self.model is None or self._selected_node_id is None:
@@ -725,7 +870,7 @@ class EditorWindow(tk.Tk):
         if self._busy or self.session is None or self.document is None:
             return
         node_id = self._selected_node_id
-        editable = numeric_tuple(self.document, node_id) if node_id is not None else None
+        editable = editable_values(self.document, node_id) if node_id is not None else None
         if editable is None:
             self.bell()
             return
@@ -735,10 +880,15 @@ class EditorWindow(tk.Tk):
         anchor = capture_selection_anchor(self.document, node_id)
 
         def operation(session: ThreeDEditSession) -> int | None:
-            session.edit_numeric_tuple(node_id, dialog.result or ())
+            session.edit_numeric_values(node_id, dialog.result or ())
             return resolve_selection_anchor(session.document, anchor)
 
-        label = "coordinate" if editable.kind == "coordinate" else "texture coordinate"
+        label = {
+            "coordinate": "coordinate",
+            "texcoord": "texture coordinate",
+            "inline-point": "point",
+            "textured-vertex": "textured vertex",
+        }.get(editable.kind, "numeric")
         self._run_edit_operation(f"Edited {label} values", operation)
 
     def undo(self) -> None:
@@ -868,10 +1018,34 @@ class EditorWindow(tk.Tk):
             has_document
             and self.document is not None
             and node is not None
-            and numeric_tuple(self.document, node.node_id) is not None
+            and editable_values(self.document, node.node_id) is not None
         )
         values_state = tk.NORMAL if can_edit_values else tk.DISABLED
         self.edit_menu.entryconfigure("Edit Values…", state=values_state)
+        self.navigate_menu.entryconfigure(
+            "Back", state=tk.NORMAL if self._navigation_back and has_document else tk.DISABLED
+        )
+        self.navigate_menu.entryconfigure(
+            "Forward",
+            state=tk.NORMAL if self._navigation_forward and has_document else tk.DISABLED,
+        )
+        can_follow = (
+            has_document
+            and self.model is not None
+            and self._selected_node_id is not None
+            and self.model.reference_for_node(self._selected_node_id) is not None
+        )
+        self.navigate_menu.entryconfigure(
+            "Follow Reference", state=tk.NORMAL if can_follow else tk.DISABLED
+        )
+        if hasattr(self, "edit_values_button"):
+            self.edit_values_button.configure(state=values_state)
+            self.back_button.configure(
+                state=tk.NORMAL if self._navigation_back and has_document else tk.DISABLED
+            )
+            self.forward_button.configure(
+                state=tk.NORMAL if self._navigation_forward and has_document else tk.DISABLED
+            )
         if hasattr(self, "tree_menu"):
             self.tree_menu.entryconfigure("Rename Definition…", state=rename_state)
             self.tree_menu.entryconfigure("Edit Values…", state=values_state)

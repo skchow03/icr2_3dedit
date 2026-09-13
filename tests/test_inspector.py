@@ -4,6 +4,7 @@ from pathlib import Path
 from time import perf_counter
 
 from icr2_3dedit.app import (
+    EditorWindow,
     LazyStructureTree,
     StructuralSelectionAnchor,
     capture_selection_anchor,
@@ -12,6 +13,7 @@ from icr2_3dedit.app import (
 from icr2_3dedit.editing import ThreeDEditSession
 from icr2_3dedit.inspector import ThreeDInspectorModel
 from icr2_3dedit.threedfile import ThreeDFile
+from icr2_3dedit.values import editable_values
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -64,6 +66,39 @@ class FakeTree:
     def see(self, item):
         self.seen.append(item)
 
+    def item(self, item, option=None, **kwargs):
+        if kwargs:
+            self.nodes[item].update(kwargs)
+        if option is not None:
+            return self.nodes[item].get(option, "")
+        return self.nodes[item]
+
+
+class NavigationHarness:
+    """Display-free host for EditorWindow's navigation-history methods."""
+
+    navigate_to = EditorWindow.navigate_to
+    navigate_back = EditorWindow.navigate_back
+    navigate_forward = EditorWindow.navigate_forward
+    _navigate_history = EditorWindow._navigate_history
+
+    def __init__(self, document: ThreeDFile, selected_node_id: int) -> None:
+        self.document = document
+        self.lazy_tree = self
+        self._selected_node_id = selected_node_id
+        self._navigation_back: list[StructuralSelectionAnchor] = []
+        self._navigation_forward: list[StructuralSelectionAnchor] = []
+        self.revealed: list[int] = []
+
+    def reveal_node(self, node_id: int) -> None:
+        self.revealed.append(node_id)
+
+    def inspect_node(self, node_id: int) -> None:
+        self._selected_node_id = node_id
+
+    def _update_command_states(self) -> None:
+        pass
+
 
 def test_inspector_reports_source_references_and_reverse_references_without_expansion():
     document = ThreeDFile.from_bytes(
@@ -110,6 +145,28 @@ def test_coordinate_properties_expose_exact_component_spellings():
     assert properties["Z"] == "3e2"
 
 
+def test_named_textured_vertex_exposes_xyzuv_without_coordinate_drilldown():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\nvertex: [<+1, 2, 3>, T=<4, 5>];\n"
+    )
+    definition_id = document.symbols["vertex"][0]
+    editable = editable_values(document, definition_id)
+    assert editable is not None
+    assert tuple(component.label for component in editable.components) == (
+        "X", "Y", "Z", "U", "V",
+    )
+    assert editable.spellings == ("+1", "2", "3", "4", "5")
+    properties = dict(ThreeDInspectorModel(document).properties(definition_id))
+    assert tuple(properties[label] for label in ("X", "Y", "Z", "U", "V")) == editable.spellings
+
+
+def test_face_definition_does_not_guess_values_from_descendant_plane_points():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\nroot: FACE ([<0,0,0>], [<1,0,0>], [<0,1,0>]) NIL;\n"
+    )
+    assert editable_values(document, document.symbols["root"][0]) is None
+
+
 def test_tree_initially_materializes_only_top_level_structural_nodes():
     document = ThreeDFile.from_bytes(
         b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nroot: LIST { a, LIST { b } };\n"
@@ -152,6 +209,48 @@ def test_selecting_an_already_selected_node_does_not_retrigger_tree_selection():
     assert tree.selected == (lazy.node_item(root),)
     assert tree.selection_set_calls == 1
     assert tree.seen == [lazy.node_item(root), lazy.node_item(root)]
+
+
+def test_reveal_node_materializes_only_its_ancestor_path():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nroot: LIST { LIST { a }, b };\n"
+    )
+    model = ThreeDInspectorModel(document)
+    reference_id = next(ref.node_id for ref in document.references if ref.name == "a")
+    tree = FakeTree()
+    lazy = LazyStructureTree(tree, model)
+    lazy.populate_roots()
+    initial_structural = sum(item.startswith("node:") for item in tree.nodes)
+
+    lazy.reveal_node(reference_id)
+
+    path_length = 0
+    current_id = reference_id
+    while document.nodes_by_id[current_id].parent_id is not None:
+        path_length += 1
+        current_id = document.nodes_by_id[current_id].parent_id
+    structural = [item for item in tree.nodes if item.startswith("node:")]
+    assert lazy.node_item(reference_id) in tree.nodes
+    assert len(structural) <= initial_structural + path_length
+    assert len(structural) < len(document.nodes_by_id)
+
+
+def test_back_and_forward_restore_source_node_selections():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nroot: LIST { a, b };\n"
+    )
+    a_id = document.symbols["a"][0]
+    root_id = document.symbols["root"][0]
+    harness = NavigationHarness(document, a_id)
+
+    harness.navigate_to(root_id)
+    assert harness._selected_node_id == root_id
+    assert len(harness._navigation_back) == 1
+    harness.navigate_back()
+    assert harness._selected_node_id == a_id
+    assert len(harness._navigation_forward) == 1
+    harness.navigate_forward()
+    assert harness._selected_node_id == root_id
 
 
 def test_selection_anchor_restores_nested_source_location_after_rename():
