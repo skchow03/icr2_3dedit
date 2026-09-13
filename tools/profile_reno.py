@@ -1,4 +1,4 @@
-"""Headless RENO pipeline benchmark; pass --tk to exercise widgets when displayed."""
+"""Profile the lossless parser and inspector projection with the RENO fixture."""
 
 from __future__ import annotations
 
@@ -11,48 +11,44 @@ import tracemalloc
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
-from icr2_3dedit.app import EditorWindow, _analyze_snapshot
-from icr2_3dedit.document import SourceDocument
-from icr2_3dedit.parser import parse_document
-from icr2_3dedit.responsive import highlight_spans
+from icr2_3dedit.app import EditorWindow
+from icr2_3dedit.inspector import ThreeDInspectorModel
+from icr2_3dedit.threedfile import ThreeDFile
 
 
 def main() -> None:
     arguments = argparse.ArgumentParser()
-    arguments.add_argument("--tk", action="store_true", help="open RENO and log the complete Tk refresh")
-    arguments.add_argument("--disable-highlighting", action="store_true", help="isolate the old suspected stage")
+    arguments.add_argument("--tk", action="store_true", help="open RENO in the lazy inspector")
     options = arguments.parse_args()
-    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     fixture = Path(__file__).parents[1] / "tests" / "fixtures" / "RENO.3D"
     if options.tk:
         window = EditorWindow()
-        if options.disable_highlighting:
-            window._highlight_source = lambda: None
-        document = SourceDocument.load(fixture)
-        window.document = document
-        window._set_text(document.text)
-        window._update_title()
+        window.after_idle(lambda: window.load_file(fixture))
         window.mainloop()
         return
 
-    started = time.perf_counter()
-    document = SourceDocument.load(fixture)
-    read_time = time.perf_counter() - started
     tracemalloc.start()
-    parse_started = time.perf_counter()
-    parsed = parse_document(document.text)
-    parse_time = time.perf_counter() - parse_started
+    started = time.perf_counter()
+    document = ThreeDFile.load(fixture)
+    parse_time = time.perf_counter() - started
+    projection_started = time.perf_counter()
+    model = ThreeDInspectorModel(document)
+    projection_time = time.perf_counter() - projection_started
     _current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    del parsed
-    generation, parsed, geometry, _graph, diagnostics, timings = _analyze_snapshot(1, document.text)
-    timings["profiled parsing"] = parse_time
-    spans = highlight_spans(document.text, 1, 50, parsed=parsed)
-    print(f"read/decode={read_time:.3f}s")
-    print(", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in timings.items()))
-    print(f"definitions={len(parsed.definitions)}, vertices={len(geometry.vertices)}, diagnostics={len(diagnostics)}")
-    print(f"initial_highlight_spans={len(spans)}, maximum={1200}, Tk tag_add calls<=4")
-    print(f"tracemalloc_peak={peak / 1024 / 1024:.1f} MiB, generation={generation}")
+
+    expandable_roots = sum(bool(model.children(node_id)) for node_id in model.root_node_ids)
+    print(f"parse={parse_time:.3f}s, inspector_projection={projection_time:.3f}s")
+    print(
+        f"definitions={len(model.root_node_ids):,}, nodes={len(document.nodes_by_id):,}, "
+        f"references={len(document.references):,}, diagnostics={len(document.diagnostics):,}"
+    )
+    print(
+        f"initial_structural_rows={len(model.root_node_ids):,}, "
+        f"expansion_placeholders={expandable_roots:,}"
+    )
+    print(f"tracemalloc_peak={peak / 1024 / 1024:.1f} MiB")
 
 
 if __name__ == "__main__":
