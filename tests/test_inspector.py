@@ -17,6 +17,9 @@ class FakeTree:
     def __init__(self) -> None:
         self.nodes: dict[str, dict] = {}
         self.children: dict[str, list[str]] = {"": []}
+        self.selected: tuple[str, ...] = ()
+        self.selection_set_calls = 0
+        self.seen: list[str] = []
 
     def insert(self, parent, _index, *, iid, text, values=(), tags=()):
         assert iid not in self.nodes
@@ -44,6 +47,16 @@ class FakeTree:
 
     def exists(self, item):
         return item in self.nodes
+
+    def selection(self):
+        return self.selected
+
+    def selection_set(self, item):
+        self.selection_set_calls += 1
+        self.selected = (item,)
+
+    def see(self, item):
+        self.seen.append(item)
 
 
 def test_inspector_reports_source_references_and_reverse_references_without_expansion():
@@ -102,6 +115,22 @@ def test_tree_initially_materializes_only_top_level_structural_nodes():
         for direct in model.children(root)
         for child in model.children(direct)
     )
+
+
+def test_selecting_an_already_selected_node_does_not_retrigger_tree_selection():
+    document = ThreeDFile.from_bytes(b"3D VERSION 3.0;\nroot: NIL;\n")
+    model = ThreeDInspectorModel(document)
+    tree = FakeTree()
+    lazy = LazyStructureTree(tree, model)
+    lazy.populate_roots()
+    root = document.symbols["root"][0]
+
+    lazy.select_node(root)
+    lazy.select_node(root)
+
+    assert tree.selected == (lazy.node_item(root),)
+    assert tree.selection_set_calls == 1
+    assert tree.seen == [lazy.node_item(root), lazy.node_item(root)]
 
 
 def test_wide_children_are_materialized_in_explicit_batches():

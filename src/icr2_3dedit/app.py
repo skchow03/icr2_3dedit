@@ -122,6 +122,15 @@ class LazyStructureTree:
         self._insert_child_batch(parent_item, parent_node_id, offset)
         return True
 
+    def select_node(self, node_id: int) -> None:
+        """Reveal a materialized node without retriggering its selection event."""
+        item = self.node_item(node_id)
+        if not self.tree.exists(item):
+            return
+        if self.tree.selection() != (item,):
+            self.tree.selection_set(item)
+        self.tree.see(item)
+
 
 class EditorWindow(tk.Tk):
     """Read-only structural browser backed exclusively by ThreeDFile."""
@@ -389,15 +398,18 @@ class EditorWindow(tk.Tk):
     def inspect_node(self, node_id: int) -> None:
         if self.model is None:
             return
+        # Treeview generates <<TreeviewSelect>> for programmatic selection too.
+        # Treat inspection as idempotent so that event cannot recursively rebuild
+        # the inspector forever.
+        if self._selected_node_id == node_id:
+            return
         self._selected_node_id = node_id
         self._source_page_index = 0
         self._populate_properties(node_id)
         self._populate_references(node_id)
         self._show_node_source()
-        item = LazyStructureTree.node_item(node_id)
-        if self.structure.exists(item):
-            self.structure.selection_set(item)
-            self.structure.see(item)
+        assert self.lazy_tree is not None
+        self.lazy_tree.select_node(node_id)
 
     def _populate_properties(self, node_id: int) -> None:
         rows = self.properties.get_children("")
