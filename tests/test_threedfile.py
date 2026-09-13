@@ -39,6 +39,14 @@ def test_inline_point_is_distinct_from_named_definition():
     assert all(n.name is None for n in inline)
     assert doc.to_bytes()==raw
 
+def test_face_plane_owns_all_three_inline_points():
+    raw=b"3D VERSION 3.0;\nface: FACE ([<1,2,3>], [<4,5,6>], [<7,8,9>]), NIL;\n"
+    doc=ThreeDFile.from_bytes(raw); face=doc.symbols["face"][0]
+    cmd=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[face].children if doc.nodes_by_id[n].kind=="command")
+    plane=next(doc.nodes_by_id[n] for n in cmd.children if doc.nodes_by_id[n].kind=="plane")
+    assert [doc.nodes_by_id[n].kind for n in plane.children]==["inline-point","inline-point","inline-point"]
+    assert all([doc.nodes_by_id[c].kind for c in doc.nodes_by_id[n].children]==["coordinate"] for n in plane.children)
+
 def test_poly_owns_all_of_its_argument_groups():
     raw=b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nc: NIL;\np: POLY [T] <2> {a,b,c};\n"
     doc=ThreeDFile.from_bytes(raw); p=doc.symbols["p"][0]
@@ -47,6 +55,31 @@ def test_poly_owns_all_of_its_argument_groups():
     assert child_kinds==["record","tuple","poly-items"]
     assert {r.name for r in doc.references if doc.nodes_by_id[r.node_id].parent_id in poly.children}=={"a","b","c"}
     assert doc.to_bytes()==raw
+
+def test_trk23d_textured_vertices_are_single_records():
+    raw=(b"3D VERSION 3.0;\n"
+         b"__dirt__: NIL;\n"
+         b"p: POLY [T] __dirt__.c {"
+         b"[<1,2,3>, t=<10,20>],"
+         b"[<4,5,6>, t=<30,40>],"
+         b"[<7,8,9>, t=<50,60>]};\n")
+    doc=ThreeDFile.from_bytes(raw); p=doc.symbols["p"][0]
+    poly=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[p].children if doc.nodes_by_id[n].kind=="command")
+    items=next(doc.nodes_by_id[n] for n in poly.children if doc.nodes_by_id[n].kind=="poly-items")
+    vertices=[doc.nodes_by_id[n] for n in items.children if doc.nodes_by_id[n].kind=="textured-vertex"]
+    assert len(vertices)==3
+    for vertex in vertices:
+        assert [doc.nodes_by_id[n].kind for n in vertex.children]==["coordinate","texcoord"]
+    assert doc.to_bytes()==raw
+
+def test_children_remain_in_source_order_after_references_are_added():
+    raw=b"3D VERSION 3.0;\na: NIL;\nb: NIL;\nroot: LIST { a, LIST { b }, a };\n"
+    doc=ThreeDFile.from_bytes(raw); root=doc.symbols["root"][0]
+    outer=next(doc.nodes_by_id[n] for n in doc.nodes_by_id[root].children if doc.nodes_by_id[n].kind=="command")
+    items=next(doc.nodes_by_id[n] for n in outer.children if doc.nodes_by_id[n].kind=="list-items")
+    children=[doc.nodes_by_id[n] for n in items.children]
+    assert [n.kind for n in children]==["reference","command","reference"]
+    assert [n.start for n in children]==sorted(n.start for n in children)
 
 def test_polygon_is_not_a_reserved_command_alias():
     doc=ThreeDFile.from_bytes(b"3D VERSION 3.0;\nPOLYGON: NIL;\nroot: LIST { POLYGON };\n")
