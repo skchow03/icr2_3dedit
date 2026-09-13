@@ -22,6 +22,9 @@ for the lossless `ThreeDFile` source model rather than a CAD program.
 - Localized lossless source serialization that copies all untouched text exactly
 - Command-based undo/redo for committed edit transactions
 - Definition renaming that updates references resolved to that exact definition
+- Inspector commands for F2/context-menu rename, Save, Save As, undo, and redo
+- Background document rebuilding after edits, with renamed-selection restoration
+- Dirty-title indication and save/discard/cancel prompting for unsaved changes
 - No geometry construction, BSP interpretation, rendering, or Papyrus traversal
   during file open
 
@@ -33,8 +36,8 @@ reconstruction as proof that every command's semantics are understood.
 
 ## Known limitations
 
-- Editing is currently exposed as a core API; GUI editing controls are not yet
-  implemented.
+- GUI editing is currently limited to renaming named definitions. Other
+  structural and property edits are not yet implemented.
 - Command semantics, geometry caches, and Papyrus-compatible traversal are not
   implemented.
 - There is no graphical model preview or OpenGL integration.
@@ -79,8 +82,7 @@ python -m pytest
 
 ## Next milestones
 
-1. Expose rename, save, and command undo/redo in the lazy inspector GUI.
-2. Add more structured source editing operations and validation.
-3. Add a separate semantic interpretation layer.
-4. Add NodeID-addressable geometry caches and a convenient editor viewport.
-5. Add Papyrus-compatible traversal, BSP visualization, and draw-order debugging.
+1. Add more structured source editing operations and validation.
+2. Add a separate semantic interpretation layer.
+3. Add NodeID-addressable geometry caches and a convenient editor viewport.
+4. Add Papyrus-compatible traversal, BSP visualization, and draw-order debugging.

@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
 
-from icr2_3dedit.app import LazyStructureTree
+from icr2_3dedit.app import (
+    LazyStructureTree,
+    StructuralSelectionAnchor,
+    capture_selection_anchor,
+    resolve_selection_anchor,
+)
+from icr2_3dedit.editing import ThreeDEditSession
 from icr2_3dedit.inspector import ThreeDInspectorModel
 from icr2_3dedit.threedfile import ThreeDFile
 
@@ -133,6 +139,30 @@ def test_selecting_an_already_selected_node_does_not_retrigger_tree_selection():
     assert tree.seen == [lazy.node_item(root), lazy.node_item(root)]
 
 
+def test_selection_anchor_restores_nested_source_location_after_rename():
+    document = ThreeDFile.from_bytes(
+        b"3D VERSION 3.0;\npoint: NIL;\nroot: LIST { point };\n"
+    )
+    root = document.symbols["root"][0]
+    reference_id = next(ref.node_id for ref in document.references)
+    anchor = capture_selection_anchor(document, reference_id)
+    session = ThreeDEditSession(document)
+    session.rename_definition(root, "renamed_root")
+
+    restored = resolve_selection_anchor(session.document, anchor)
+    assert restored is not None
+    assert session.document.nodes_by_id[restored].kind == "reference"
+    assert session.document.nodes_by_id[restored].name == "point"
+
+
+def test_invalid_selection_anchors_fail_without_guessing():
+    document = ThreeDFile.from_bytes(b"3D VERSION 3.0;\nroot: NIL;\n")
+    assert capture_selection_anchor(document, None) is None
+    assert capture_selection_anchor(document, 999_999) is None
+    assert resolve_selection_anchor(document, StructuralSelectionAnchor(-1, ())) is None
+    assert resolve_selection_anchor(document, StructuralSelectionAnchor(0, (99,))) is None
+
+
 def test_wide_children_are_materialized_in_explicit_batches():
     definitions = "\n".join(f"p{i}: NIL;" for i in range(600))
     names = ",".join(f"p{i}" for i in range(600))
@@ -164,6 +194,25 @@ def test_wide_children_are_materialized_in_explicit_batches():
     ]
     assert len(structural_children) == 25
     assert len(more) == 1
+
+
+def test_reparsed_edit_repopulates_only_top_level_tree_rows():
+    definitions = "\n".join(f"p{i}: NIL;" for i in range(600))
+    names = ",".join(f"p{i}" for i in range(600))
+    document = ThreeDFile.from_bytes(
+        f"3D VERSION 3.0;\n{definitions}\nroot: LIST {{{names}}};\n".encode()
+    )
+    session = ThreeDEditSession(document)
+    session.rename_definition(document.symbols["p0"][0], "first_point")
+    model = ThreeDInspectorModel(session.document)
+    tree = FakeTree()
+    lazy = LazyStructureTree(tree, model)
+    lazy.populate_roots()
+
+    structural_items = [item for item in tree.nodes if item.startswith("node:")]
+    assert len(structural_items) == len(session.document.top_level_nodes)
+    assert len(structural_items) * 2 < len(session.document.nodes_by_id)
+    assert lazy.node_item(session.document.symbols["first_point"][0]) in tree.nodes
 
 
 def test_reno_inspector_projection_does_not_duplicate_the_structural_tree():
