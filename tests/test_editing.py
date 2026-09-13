@@ -5,7 +5,7 @@ import pytest
 from icr2_3dedit.editing import ThreeDEditSession
 from icr2_3dedit.serializer import ThreeDSerializer, ThreeDSourceEdit
 from icr2_3dedit.threedfile import ThreeDFile
-from icr2_3dedit.values import numeric_tuple, validate_numeric_literal
+from icr2_3dedit.values import editable_values, numeric_tuple, validate_numeric_literal
 
 
 def test_serializer_copies_untouched_source_and_builds_inverse_edits():
@@ -110,6 +110,27 @@ def test_numeric_tuple_noop_does_not_create_history():
     session.edit_numeric_tuple(coordinate_id, editable.spellings)
     assert not session.can_undo
     assert not session.document.dirty
+
+
+def test_named_textured_vertex_edits_xyzuv_as_one_lossless_command():
+    raw = (
+        b"3D VERSION 3.0;\r\n"
+        b"vertex:\t[<+1.0,  2, 3>, T=<004, -5>]; % preserve\r\n"
+    )
+    session = ThreeDEditSession(ThreeDFile.from_bytes(raw))
+    definition_id = session.document.symbols["vertex"][0]
+    projected = editable_values(session.document, definition_id)
+    assert projected is not None
+    session.edit_numeric_values(definition_id, ("+1.0", "22", "3", "004", "-.5"))
+
+    assert session.document.to_bytes() == raw.replace(b"  2,", b"  22,").replace(b"-5>", b"-.5>")
+    assert session.undo_description == "Edit textured-vertex values"
+    session.undo()
+    assert session.document.to_bytes() == raw
+    session.redo()
+    assert editable_values(session.document, definition_id).spellings == (
+        "+1.0", "22", "3", "004", "-.5",
+    )
 
 
 @pytest.mark.parametrize("valid", ["0", "+1", "-2", ".5", "1.", "-3.25e+4"])

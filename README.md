@@ -25,6 +25,12 @@ inspector for the lossless `ThreeDFile` source model rather than a CAD program.
 - Inspector commands for F2/context-menu rename, Save, Save As, undo, and redo
 - Structured X/Y/Z and U/V editing for coordinate and texcoord nodes via
   **Edit Values…** (Ctrl+E), replacing only the selected number tokens
+- Point values projected onto named definitions, inline points, and textured
+  vertices so their coordinate children do not need to be selected separately
+- Reference following from the structure tree with Enter/double-click and
+  browser-style Back/Forward navigation
+- Selection restoration after edits that reveals only the selected ancestor
+  path rather than rebuilding unrelated tree branches
 - Background document rebuilding after edits, with renamed-selection restoration
 - Dirty-title indication and save/discard/cancel prompting for unsaved changes
 - No geometry construction, BSP interpretation, rendering, or Papyrus traversal
@@ -45,10 +51,11 @@ reconstruction as proof that every command's semantics are understood.
 - There is no graphical model preview or OpenGL integration.
 - Unknown syntax is preserved and may remain structurally unclassified.
 
-Double-click a reference to inspect its resolved definition. Double-click a
-reverse-reference row to inspect that reference node. Expand a structure row to
-request its direct children; use the explicit **Load next** row when a construct
-has more than 250 direct children.
+Double-click a reference, or select it and press Enter, to inspect its resolved
+definition. Use Alt+Left and Alt+Right to move through selection history.
+Double-click a reverse-reference row to inspect that reference node. Expand a
+structure row to request its direct children; use the explicit **Load next** row
+when a construct has more than 250 direct children.
 
 ## Run
 

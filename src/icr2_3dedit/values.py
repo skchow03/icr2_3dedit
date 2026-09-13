@@ -42,6 +42,27 @@ class ThreeDNumericTuple:
         return tuple(component.spelling for component in self.components)
 
 
+@dataclass(frozen=True, slots=True)
+class ThreeDEditableValues:
+    """Numeric tuples exposed for one selected source object."""
+
+    node_id: int
+    kind: str
+    tuples: tuple[ThreeDNumericTuple, ...]
+
+    @property
+    def components(self) -> tuple[ThreeDNumericComponent, ...]:
+        return tuple(
+            component
+            for editable_tuple in self.tuples
+            for component in editable_tuple.components
+        )
+
+    @property
+    def spellings(self) -> tuple[str, ...]:
+        return tuple(component.spelling for component in self.components)
+
+
 def numeric_tuple(document: ThreeDFile, node_id: int) -> ThreeDNumericTuple | None:
     """Return an editable tuple only when its complete syntax is verified.
 
@@ -68,6 +89,47 @@ def numeric_tuple(document: ThreeDFile, node_id: int) -> ThreeDNumericTuple | No
             for label, token in zip(labels, numbers)
         ),
     )
+
+
+def editable_values(document: ThreeDFile, node_id: int) -> ThreeDEditableValues | None:
+    """Project verified point values onto a convenient selected source object.
+
+    Only direct, recognized wrappers are inspected.  This does not search a
+    subtree, follow references, or infer that a FACE/BSP plane is one point.
+    """
+    node = document.nodes_by_id.get(node_id)
+    if node is None:
+        return None
+    direct = numeric_tuple(document, node_id)
+    if direct is not None:
+        return ThreeDEditableValues(node_id, direct.kind, (direct,))
+
+    wrapper_id = node_id
+    if node.kind == "definition":
+        wrappers = tuple(
+            child_id for child_id in node.children
+            if document.nodes_by_id[child_id].kind in {"inline-point", "textured-vertex"}
+        )
+        if len(wrappers) != 1 or len(node.children) != 1:
+            return None
+        wrapper_id = wrappers[0]
+        node = document.nodes_by_id[wrapper_id]
+    if node.kind not in {"inline-point", "textured-vertex"}:
+        return None
+
+    tuples = tuple(
+        editable
+        for child_id in node.children
+        if (editable := numeric_tuple(document, child_id)) is not None
+    )
+    expected = (
+        ("coordinate",)
+        if node.kind == "inline-point"
+        else ("coordinate", "texcoord")
+    )
+    if tuple(item.kind for item in tuples) != expected:
+        return None
+    return ThreeDEditableValues(node_id, node.kind, tuples)
 
 
 def validate_numeric_literal(value: str) -> None:

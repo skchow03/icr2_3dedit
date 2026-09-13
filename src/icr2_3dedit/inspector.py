@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from .syntax import TokenKind
 from .threedfile import ThreeDDiagnostic, ThreeDFile, ThreeDNode, ThreeDReference
-from .values import numeric_tuple
+from .values import editable_values
 
 
 SOURCE_PAGE_CHARS = 100_000
@@ -158,7 +158,7 @@ class ThreeDInspectorModel:
             else:
                 target = "unresolved"
             values.append(("Reference target", target))
-        editable = numeric_tuple(self.document, node_id)
+        editable = editable_values(self.document, node_id)
         if editable is not None:
             values.extend(
                 (component.label, component.spelling)
