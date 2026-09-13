@@ -2,7 +2,7 @@
 
 This module deliberately models syntax, not rendering semantics. It keeps the
 original byte stream authoritative while providing stable NodeIDs for named
-definitions, command expressions, delimiter groups, and references.
+definitions, command expressions, delimiter groups, inline values, and references.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -118,39 +118,73 @@ class _Builder:
                 node=self.nodes[ids[1]]; self._diag(self.tokens[node.token_start],"duplicate-symbol",f"Duplicate definition {name!r}")
         self._collect_references(); return self.nodes,self.top,self.symbols,self.refs,self.diags,self.max_depth
 
+    def _classify_group(self, opener, parent_id):
+        """Classify only syntax shapes we can identify without rendering semantics."""
+        parent=self.nodes.get(parent_id)
+        if opener=="<": return "tuple"
+        if opener=="[":
+            # [<x,y,z>] is the observed point/vertex value form. Other bracket
+            # records such as [T] remain generic record groups.
+            return "record"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="LIST":
+            return "list-items"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="POLY":
+            return "poly-items"
+        if opener=="(" and parent is not None and parent.kind=="command" and parent.command in {"FACE","FACE2","BSPF","BSPN","BSPA","BSP2"}:
+            return "plane"
+        return "group"
+
     def _build_structure(self, definition_id, start, end):
-        """Create explicit command nodes while retaining lossless delimiter groups."""
-        stack=[]; pending=None; created=[]
+        """Create command nodes and conservative lossless syntax-shape nodes."""
+        stack=[]; active_command=None; created=[]
         for i in range(start,end):
             tok=self.tokens[i]; current=stack[-1][0] if stack else definition_id
             if tok.kind is TokenKind.IDENTIFIER and tok.text.upper() in COMMANDS:
                 cmd=tok.text.upper()
                 if cmd not in {"NIL","EXTERN"}:
-                    cid=self._new("command",tok.start,tok.end,current,i,i+1,command=cmd); created.append(cid); pending=cid
-                else: pending=None
+                    cid=self._new("command",tok.start,tok.end,current,i,i+1,command=cmd); created.append(cid); active_command=cid
+                else: active_command=None
                 continue
             if tok.kind in _TRIVIA: continue
             if tok.kind is TokenKind.OPEN:
-                parent=pending if pending is not None else current
-                gid=self._new("group",tok.start,tok.end,parent,i,i+1,opener=tok.text); created.append(gid); stack.append((gid,tok.text))
-                if pending is not None: self.nodes[pending].end=tok.end; self.nodes[pending].token_end=i+1
-                pending=None; continue
+                # A direct RHS command can own multiple successive argument groups
+                # (notably POLY [T] <n> {...}); nested commands own their own groups.
+                parent=active_command if active_command is not None else current
+                kind=self._classify_group(tok.text,parent)
+                gid=self._new(kind,tok.start,tok.end,parent,i,i+1,opener=tok.text); created.append(gid); stack.append((gid,tok.text))
+                if active_command is not None:
+                    c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
+                continue
             if tok.kind is TokenKind.CLOSE and stack and _OPEN_TO_CLOSE.get(stack[-1][1])==tok.text:
                 gid,_=stack.pop(); g=self.nodes[gid]; g.end=tok.end; g.token_end=i+1; g.closer=tok.text
                 if g.parent_id is not None and self.nodes[g.parent_id].kind=="command":
                     c=self.nodes[g.parent_id]; c.end=tok.end; c.token_end=i+1
-                pending=None; continue
-            if pending is not None:
-                c=self.nodes[pending]; c.end=tok.end; c.token_end=i+1
-            if tok.kind is TokenKind.COMMA: pending=None
-        # Direct RHS commands span the RHS, while nested container commands retain their group span.
+                continue
+            if active_command is not None:
+                c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
+            # Commas end the active command only for commands whose syntax is a
+            # leading container followed by sibling object arguments. POLY/LIST
+            # keep ownership so later groups remain part of the same construct.
+            if tok.kind is TokenKind.COMMA and active_command is not None:
+                if self.nodes[active_command].command not in {"POLY","LIST"}:
+                    active_command=None
+
+        # Reclassify [<...>] records as explicit inline points. This is structural:
+        # no coordinate interpretation or geometry conversion occurs here.
+        for nid in created:
+            n=self.nodes[nid]
+            if n.kind!="record": continue
+            meaningful=[self.nodes[c] for c in n.children if self.nodes[c].kind not in {"reference"}]
+            tuple_children=[c for c in meaningful if c.kind=="tuple"]
+            if len(tuple_children)==1:
+                n.kind="inline-point"
+
         if end>start:
             last=self.tokens[end-1]
             for nid in created:
                 n=self.nodes[nid]
                 if n.kind=="command" and n.parent_id==definition_id and n.token_start==start:
                     n.end=max(n.end,last.end); n.token_end=max(n.token_end,end)
-        # Only nodes created for this definition are considered: total work remains linear in file size.
         events={}
         for nid in created:
             n=self.nodes[nid]
