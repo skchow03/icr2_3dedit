@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable
 
 from .syntax import Token, TokenKind, tokenize
 
@@ -147,17 +146,56 @@ class _Builder:
         self.diags.append(ThreeDDiagnostic(severity, code, message, token.start,
                                            token.end, token.line, token.column))
 
+    def _statement_start_after_semicolonless_header(self) -> int:
+        """Return the first token after a line-oriented ``3D VERSION`` header.
+
+        Papyrus/TRK23D files exist with both ``3D VERSION 3.0;`` and
+        ``3D VERSION 3.0``.  In the latter form the header must not be allowed to
+        become part of the first semicolon-terminated definition.
+        """
+        line_end = len(self.source)
+        for marker in ("\r", "\n"):
+            pos = self.source.find(marker)
+            if pos != -1:
+                line_end = min(line_end, pos)
+
+        sig = [
+            (i, tok) for i, tok in enumerate(self.tokens)
+            if tok.start < line_end and tok.kind not in _TRIVIA
+        ]
+        if len(sig) < 3:
+            return 0
+        if sig[0][1].text.upper() != "3D" or sig[1][1].text.upper() != "VERSION":
+            return 0
+        if any(tok.kind is TokenKind.SEMICOLON for _, tok in sig):
+            return 0
+
+        # Start at the first token whose source span begins on/after the next
+        # line. Whitespace spanning the newline remains preserved in the source
+        # buffer even though it is not owned by the first definition node.
+        next_line = line_end
+        if self.source[line_end:line_end + 2] == "\r\n":
+            next_line += 2
+        elif line_end < len(self.source) and self.source[line_end] in "\r\n":
+            next_line += 1
+        for i, tok in enumerate(self.tokens):
+            if tok.start >= next_line:
+                return i
+            if tok.start < next_line < tok.end:
+                return i + 1
+        return len(self.tokens)
+
     def build(self):
         # First identify top-level semicolon-terminated statements while respecting
-        # delimiter nesting.  Header text before the first definition is retained
-        # by the token stream and original bytes; only definitions become nodes.
+        # delimiter nesting. A semicolonless `3D VERSION` header is line-oriented
+        # and excluded explicitly so it cannot swallow the first definition.
         stack: list[tuple[str, Token]] = []
-        statement_start = 0
+        statement_start = self._statement_start_after_semicolonless_header()
         ranges: list[tuple[int, int]] = []
         for i, tok in enumerate(self.tokens):
+            if i < statement_start:
+                continue
             if tok.kind is TokenKind.OPEN:
-                # '<' is normally a vector delimiter. Treat it structurally only
-                # when a matching '>' exists through the normal stack discipline.
                 stack.append((tok.text, tok))
                 self.max_depth = max(self.max_depth, len(stack))
             elif tok.kind is TokenKind.CLOSE:
@@ -215,20 +253,19 @@ class _Builder:
     def _collect_references(self) -> None:
         # Reference occurrences are represented as nodes too.  We intentionally
         # do not expand targets; resolution is a symbol-table lookup only.
+        from .syntax import COMMANDS, KEYWORDS, RECORD_FIELDS
+
         for definition_id in self.top:
             definition = self.nodes[definition_id]
             sig = [i for i in range(definition.token_start, definition.token_end)
                    if self.tokens[i].kind not in _TRIVIA]
             if len(sig) < 3:
                 continue
-            # Skip definition name and colon; consider identifiers in the RHS.
             for pos, i in enumerate(sig[2:], start=2):
                 tok = self.tokens[i]
                 if tok.kind is not TokenKind.IDENTIFIER:
                     continue
                 upper = tok.text.upper()
-                # Commands/keywords/record field names are syntax, not references.
-                from .syntax import COMMANDS, KEYWORDS, RECORD_FIELDS
                 if upper in COMMANDS or upper in KEYWORDS or upper in RECORD_FIELDS:
                     continue
                 prev = self.tokens[sig[pos - 1]] if pos else None
@@ -253,8 +290,6 @@ class _Builder:
     def _innermost_group(self, definition_id: int, offset: int) -> int | None:
         best = None
         best_span = None
-        # This is deliberately simple for pass 1.  It is linear in groups within
-        # one definition; semantic/render expansion remains absent.
         pending = list(self.nodes[definition_id].children)
         while pending:
             nid = pending.pop()
