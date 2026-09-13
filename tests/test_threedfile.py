@@ -26,6 +26,27 @@ def test_semicolonless_header_does_not_swallow_first_definition():
     assert doc.to_bytes() == raw
 
 
+def test_papyrus_commands_are_not_references():
+    raw = (
+        b"3D VERSION 3.0;\n"
+        b"nil: NIL;\n"
+        b"a: [<0, 0, 0>];\n"
+        b"b: [<1, 0, 0>];\n"
+        b"c: [<0, 1, 0>];\n"
+        b"p: POLY <1> {a,b,c};\n"
+        b"face: FACE2 (a,b,c), p, p;\n"
+        b"near: BSPN (a,b,c), face, p;\n"
+        b"around: BSPA (a,b,c), p, face, near;\n"
+        b"both: BSP2 (a,b,c), p, face, near;\n"
+        b"front: BSPF (a,b,c), nil, p, both;\n"
+    )
+    doc = ThreeDFile.from_bytes(raw)
+    command_names = {"NIL", "POLY", "FACE2", "BSPN", "BSPA", "BSP2", "BSPF"}
+    assert not command_names.intersection(r.name.upper() for r in doc.references)
+    assert not [d for d in doc.diagnostics if d.code == "unresolved-reference"]
+    assert doc.to_bytes() == raw
+
+
 def test_top_level_order_and_stable_internal_nodes():
     doc = ThreeDFile.from_bytes(b"3D VERSION 3.0;\nA: NIL;\nC: NIL;\nB: NIL;\n")
     assert [doc.nodes_by_id[n].name for n in doc.top_level_nodes] == ["A", "C", "B"]
