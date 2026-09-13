@@ -9,6 +9,23 @@ def test_byte_exact_round_trip():
     assert doc.to_bytes() == raw
 
 
+def test_semicolonless_header_does_not_swallow_first_definition():
+    raw = (
+        b"3D VERSION 3.0\r\n"
+        b"__TSO0: DYNAMIC -3614452, 2473032, 102000, 120, 0, 0, 1, EXTERN \"stand100\";\r\n"
+        b"__TSO1: DYNAMIC -4468161, 2288751, 102000, 120, 0, 0, 1, EXTERN \"stand100\";\r\n"
+        b"root: LIST { __TSO0, __TSO1 };\r\n"
+    )
+    doc = ThreeDFile.from_bytes(raw)
+    assert "__TSO0" in doc.symbols
+    assert "__TSO1" in doc.symbols
+    assert [doc.nodes_by_id[n].name for n in doc.top_level_nodes] == ["__TSO0", "__TSO1", "root"]
+    tso0_ref = next(r for r in doc.references if r.name == "__TSO0")
+    assert tso0_ref.target_node_id == doc.symbols["__TSO0"][0]
+    assert not any(d.code == "unresolved-reference" and "__TSO0" in d.message for d in doc.diagnostics)
+    assert doc.to_bytes() == raw
+
+
 def test_top_level_order_and_stable_internal_nodes():
     doc = ThreeDFile.from_bytes(b"3D VERSION 3.0;\nA: NIL;\nC: NIL;\nB: NIL;\n")
     assert [doc.nodes_by_id[n].name for n in doc.top_level_nodes] == ["A", "C", "B"]
