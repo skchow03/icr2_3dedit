@@ -116,22 +116,21 @@ class _Builder:
         for name,ids in self.symbols.items():
             if len(ids)>1:
                 node=self.nodes[ids[1]]; self._diag(self.tokens[node.token_start],"duplicate-symbol",f"Duplicate definition {name!r}")
-        self._collect_references(); return self.nodes,self.top,self.symbols,self.refs,self.diags,self.max_depth
+        self._collect_references()
+        # References are added after syntax nodes; restore source order for every
+        # parent's children so the structural tree remains a faithful source view.
+        for node in self.nodes.values():
+            node.children.sort(key=lambda nid: (self.nodes[nid].start, self.nodes[nid].end, nid))
+        return self.nodes,self.top,self.symbols,self.refs,self.diags,self.max_depth
 
     def _classify_group(self, opener, parent_id):
         """Classify only syntax shapes we can identify without rendering semantics."""
         parent=self.nodes.get(parent_id)
         if opener=="<": return "tuple"
-        if opener=="[":
-            # [<x,y,z>] is the observed point/vertex value form. Other bracket
-            # records such as [T] remain generic record groups.
-            return "record"
-        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="LIST":
-            return "list-items"
-        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="POLY":
-            return "poly-items"
-        if opener=="(" and parent is not None and parent.kind=="command" and parent.command in {"FACE","FACE2","BSPF","BSPN","BSPA","BSP2"}:
-            return "plane"
+        if opener=="[": return "record"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="LIST": return "list-items"
+        if opener=="{" and parent is not None and parent.kind=="command" and parent.command=="POLY": return "poly-items"
+        if opener=="(" and parent is not None and parent.kind=="command" and parent.command in {"FACE","FACE2","BSPF","BSPN","BSPA","BSP2"}: return "plane"
         return "group"
 
     def _build_structure(self, definition_id, start, end):
@@ -147,12 +146,13 @@ class _Builder:
                 continue
             if tok.kind in _TRIVIA: continue
             if tok.kind is TokenKind.OPEN:
-                # A direct RHS command can own multiple successive argument groups
-                # (notably POLY [T] <n> {...}); nested commands own their own groups.
-                parent=active_command if active_command is not None else current
+                # A command owns a group only when that group begins at the same
+                # syntax level as the command. Once inside a plane/record/list,
+                # nested groups belong to that container, not to the outer command.
+                parent=active_command if active_command is not None and current==self.nodes[active_command].parent_id else current
                 kind=self._classify_group(tok.text,parent)
                 gid=self._new(kind,tok.start,tok.end,parent,i,i+1,opener=tok.text); created.append(gid); stack.append((gid,tok.text))
-                if active_command is not None:
+                if parent==active_command:
                     c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
                 continue
             if tok.kind is TokenKind.CLOSE and stack and _OPEN_TO_CLOSE.get(stack[-1][1])==tok.text:
@@ -160,24 +160,29 @@ class _Builder:
                 if g.parent_id is not None and self.nodes[g.parent_id].kind=="command":
                     c=self.nodes[g.parent_id]; c.end=tok.end; c.token_end=i+1
                 continue
-            if active_command is not None:
+            if active_command is not None and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
                 c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
-            # Commas end the active command only for commands whose syntax is a
-            # leading container followed by sibling object arguments. POLY/LIST
-            # keep ownership so later groups remain part of the same construct.
             if tok.kind is TokenKind.COMMA and active_command is not None:
-                if self.nodes[active_command].command not in {"POLY","LIST"}:
+                if self.nodes[active_command].command not in {"POLY","LIST"} and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
                     active_command=None
 
-        # Reclassify [<...>] records as explicit inline points. This is structural:
-        # no coordinate interpretation or geometry conversion occurs here.
+        # Classify bracket records from their actual contents. TRK23D emits both
+        # plain points [<x,y,z>] and textured polygon vertices
+        # [<x,y,z>, t=<u,v>]. Keep the entire bracket expression as one node.
         for nid in created:
             n=self.nodes[nid]
             if n.kind!="record": continue
-            meaningful=[self.nodes[c] for c in n.children if self.nodes[c].kind not in {"reference"}]
-            tuple_children=[c for c in meaningful if c.kind=="tuple"]
-            if len(tuple_children)==1:
+            direct=[self.nodes[c] for c in n.children]
+            tuples=[c for c in direct if c.kind=="tuple"]
+            if len(tuples)==1:
                 n.kind="inline-point"
+                tuples[0].kind="coordinate"
+            elif len(tuples)==2:
+                text=self.source[n.start:n.end].lower()
+                if "t" in text and "=" in text:
+                    n.kind="textured-vertex"
+                    tuples[0].kind="coordinate"
+                    tuples[1].kind="texcoord"
 
         if end>start:
             last=self.tokens[end-1]
