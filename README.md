@@ -19,6 +19,9 @@ for the lossless `ThreeDFile` source model rather than a CAD program.
 - Read-only, exact source slices for the selected NodeID; very large spans are
   paged in 100,000-character chunks rather than copied wholesale into a widget
 - Parser diagnostics with source context
+- Localized lossless source serialization that copies all untouched text exactly
+- Command-based undo/redo for committed edit transactions
+- Definition renaming that updates references resolved to that exact definition
 - No geometry construction, BSP interpretation, rendering, or Papyrus traversal
   during file open
 
@@ -30,7 +33,8 @@ reconstruction as proof that every command's semantics are understood.
 
 ## Known limitations
 
-- Modified-document serialization and structured editing are not implemented.
+- Editing is currently exposed as a core API; GUI editing controls are not yet
+  implemented.
 - Command semantics, geometry caches, and Papyrus-compatible traversal are not
   implemented.
 - There is no graphical model preview or OpenGL integration.
@@ -66,15 +70,17 @@ case in the automated inspector tests:
 python -m pytest tests/test_inspector.py
 ```
 
-After the editable install above, run the standard-library tests with:
+Install the test extra and run the test suite with:
 
 ```bash
+python -m pip install -e ".[test]"
 python -m pytest
 ```
 
 ## Next milestones
 
-1. Add command-based editing and localized lossless serialization.
-2. Add a separate semantic interpretation layer.
-3. Add NodeID-addressable geometry caches and a convenient editor viewport.
-4. Add Papyrus-compatible traversal, BSP visualization, and draw-order debugging.
+1. Expose rename, save, and command undo/redo in the lazy inspector GUI.
+2. Add more structured source editing operations and validation.
+3. Add a separate semantic interpretation layer.
+4. Add NodeID-addressable geometry caches and a convenient editor viewport.
+5. Add Papyrus-compatible traversal, BSP visualization, and draw-order debugging.

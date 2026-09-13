@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
+from .document import atomic_write
 from .syntax import COMMANDS, KEYWORDS, RECORD_FIELDS, Token, TokenKind, tokenize
 
 _OPEN_TO_CLOSE = {"{": "}", "(": ")", "[": "]", "<": ">"}
@@ -73,13 +74,14 @@ class ThreeDFile:
         result.parse_seconds = perf_counter() - started; return result
 
     def to_bytes(self) -> bytes:
-        if self.dirty: raise NotImplementedError("Step 1 only guarantees byte-exact serialization for an unchanged document")
+        # Edited instances are created by localized serialization and reparsed,
+        # so original_bytes is always the exact current representation.
         return self.original_bytes
 
     def save(self, path: str | Path | None = None) -> Path:
         destination = Path(path) if path is not None else self.path
         if destination is None: raise ValueError("A destination is required")
-        destination.write_bytes(self.to_bytes()); self.path = destination; return destination
+        atomic_write(destination, self.to_bytes()); self.path = destination; self.dirty = False; return destination
 
     def node_text(self, node_id: int) -> str:
         node = self.nodes_by_id[node_id]; return self.source_text[node.start:node.end]
