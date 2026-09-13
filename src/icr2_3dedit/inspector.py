@@ -18,6 +18,7 @@ from .values import editable_values
 
 SOURCE_PAGE_CHARS = 100_000
 TREE_CHILD_BATCH = 250
+SEARCH_RESULT_LIMIT = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,17 @@ class SourcePage:
     node_end: int
     page_index: int
     page_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class InspectorSearchResult:
+    """One bounded result row for the inspector's lazy find UI."""
+
+    node_id: int
+    label: str
+    kind: str
+    line: int
+    detail: str
 
 
 class ThreeDInspectorModel:
@@ -165,3 +177,96 @@ class ThreeDInspectorModel:
                 for component in editable.components
             )
         return tuple(values)
+
+    def search(
+        self,
+        query: str,
+        *,
+        kind_filter: str = "All",
+        limit: int = SEARCH_RESULT_LIMIT,
+    ) -> tuple[InspectorSearchResult, ...]:
+        """Return a capped structural search result set without GUI expansion."""
+        needle = query.strip().casefold()
+        if not needle:
+            return ()
+        results: list[InspectorSearchResult] = []
+        for node_id in sorted(self.document.nodes_by_id):
+            node = self.node(node_id)
+            if not self._matches_search_kind(node_id, kind_filter):
+                continue
+            label = self.label(node_id)
+            haystack_parts = [
+                label,
+                node.kind,
+                node.name or "",
+                node.command or "",
+                str(node.node_id),
+            ]
+            reference = self.reference_for_node(node_id)
+            if reference is not None:
+                haystack_parts.append(reference.name)
+                if reference.target_node_id is not None:
+                    target = self.node(reference.target_node_id)
+                    haystack_parts.append(target.name or "")
+                    haystack_parts.append(str(reference.target_node_id))
+            haystack = "\n".join(haystack_parts).casefold()
+            if needle not in haystack:
+                continue
+            line, _ = self.line_and_column(node_id)
+            results.append(
+                InspectorSearchResult(
+                    node_id=node_id,
+                    label=label,
+                    kind=self._display_kind(node_id),
+                    line=line,
+                    detail=self._search_detail(node_id),
+                )
+            )
+            if len(results) >= limit:
+                break
+        return tuple(results)
+
+    def _display_kind(self, node_id: int) -> str:
+        node = self.node(node_id)
+        if node.kind == "command" and node.command:
+            return node.command
+        return node.kind
+
+    def _matches_search_kind(self, node_id: int, kind_filter: str) -> bool:
+        if kind_filter == "All":
+            return True
+        node = self.node(node_id)
+        if kind_filter == "Definitions":
+            return node.kind == "definition"
+        if kind_filter == "Commands":
+            return node.kind == "command"
+        if kind_filter == "References":
+            return node.kind == "reference"
+        if kind_filter == "Editable Values":
+            return editable_values(self.document, node_id) is not None
+        if kind_filter == "Diagnostics":
+            return False
+        return False
+
+    def _search_detail(self, node_id: int) -> str:
+        node = self.node(node_id)
+        if node.kind == "reference":
+            reference = self.reference_for_node(node_id)
+            if reference is None:
+                return ""
+            if reference.target_node_id is not None:
+                target = self.node(reference.target_node_id)
+                target_name = target.name or f"Node {reference.target_node_id}"
+                return f"targets {target_name}"
+            return "ambiguous" if reference.ambiguous else "unresolved"
+        if node.kind == "definition" and node.name:
+            return node.name
+        if node.kind == "command" and node.command:
+            return node.command
+        editable = editable_values(self.document, node_id)
+        if editable is not None:
+            return ", ".join(
+                f"{component.label}={component.spelling}"
+                for component in editable.components
+            )
+        return ""
