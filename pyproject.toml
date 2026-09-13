@@ -12,6 +12,9 @@ license = {text = "MIT"}
 authors = [{name = "ICR2 community"}]
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.scripts]
 icr2-3dedit = "icr2_3dedit.app:main"
 
