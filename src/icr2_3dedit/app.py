@@ -15,6 +15,7 @@ from .editing import ThreeDEditSession
 from .inspector import TREE_CHILD_BATCH, ThreeDInspectorModel
 from .parser import Statement
 from .threedfile import ThreeDDiagnostic, ThreeDFile
+from .values import ThreeDNumericTuple, numeric_tuple, validate_numeric_literal
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,6 +28,49 @@ class StructuralSelectionAnchor:
 
     root_index: int
     child_indexes: tuple[int, ...]
+
+
+class NumericTupleDialog(simpledialog.Dialog):
+    """Small modal editor that keeps numeric spelling under user control."""
+
+    def __init__(self, parent: tk.Misc, editable: ThreeDNumericTuple) -> None:
+        self.editable = editable
+        self.entries: list[ttk.Entry] = []
+        self.result: tuple[str, ...] | None = None
+        label = "coordinate" if editable.kind == "coordinate" else "texture coordinate"
+        super().__init__(parent, f"Edit {label}")
+
+    def body(self, master: tk.Misc) -> tk.Widget | None:
+        ttk.Label(
+            master,
+            text="Only the number tokens will change; surrounding source stays exact.",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        for row, component in enumerate(self.editable.components, start=1):
+            ttk.Label(master, text=f"{component.label}:").grid(
+                row=row, column=0, sticky="e", padx=(0, 6), pady=2
+            )
+            entry = ttk.Entry(master, width=28)
+            entry.insert(0, component.spelling)
+            entry.grid(row=row, column=1, sticky="ew", pady=2)
+            self.entries.append(entry)
+        master.columnconfigure(1, weight=1)
+        return self.entries[0] if self.entries else None
+
+    def validate(self) -> bool:
+        for component, entry in zip(self.editable.components, self.entries):
+            try:
+                validate_numeric_literal(entry.get())
+            except ValueError as error:
+                messagebox.showerror(
+                    f"Invalid {component.label} value", str(error), parent=self
+                )
+                entry.focus_set()
+                entry.selection_range(0, tk.END)
+                return False
+        return True
+
+    def apply(self) -> None:
+        self.result = tuple(entry.get() for entry in self.entries)
 
 
 def capture_selection_anchor(
@@ -237,6 +281,10 @@ class EditorWindow(tk.Tk):
             label="Rename Definition…", accelerator="F2",
             command=self.rename_selected_definition,
         )
+        self.edit_menu.add_command(
+            label="Edit Values…", accelerator="Ctrl+E",
+            command=self.edit_selected_values,
+        )
         menu.add_cascade(label="Edit", menu=self.edit_menu)
         self.config(menu=menu)
         self.bind_all("<Control-o>", lambda _event: self.open_file())
@@ -244,6 +292,7 @@ class EditorWindow(tk.Tk):
         self.bind_all("<Control-Shift-s>", lambda _event: self.save_file(True))
         self.bind_all("<Control-z>", lambda _event: self.undo())
         self.bind_all("<Control-y>", lambda _event: self.redo())
+        self.bind_all("<Control-e>", lambda _event: self.edit_selected_values())
         self.bind_all("<F2>", lambda _event: self.rename_selected_definition())
 
     def _build_ui(self) -> None:
@@ -288,6 +337,9 @@ class EditorWindow(tk.Tk):
         self.tree_menu = tk.Menu(self.structure, tearoff=False)
         self.tree_menu.add_command(
             label="Rename Definition…", command=self.rename_selected_definition
+        )
+        self.tree_menu.add_command(
+            label="Edit Values…", command=self.edit_selected_values
         )
 
         vertical = ttk.Panedwindow(detail_frame, orient=tk.VERTICAL)
@@ -669,6 +721,26 @@ class EditorWindow(tk.Tk):
             lambda session: session.rename_definition(node_id, new_name),
         )
 
+    def edit_selected_values(self) -> None:
+        if self._busy or self.session is None or self.document is None:
+            return
+        node_id = self._selected_node_id
+        editable = numeric_tuple(self.document, node_id) if node_id is not None else None
+        if editable is None:
+            self.bell()
+            return
+        dialog = NumericTupleDialog(self, editable)
+        if dialog.result is None or dialog.result == editable.spellings:
+            return
+        anchor = capture_selection_anchor(self.document, node_id)
+
+        def operation(session: ThreeDEditSession) -> int | None:
+            session.edit_numeric_tuple(node_id, dialog.result or ())
+            return resolve_selection_anchor(session.document, anchor)
+
+        label = "coordinate" if editable.kind == "coordinate" else "texture coordinate"
+        self._run_edit_operation(f"Edited {label} values", operation)
+
     def undo(self) -> None:
         if self._busy or self.session is None or not self.session.can_undo:
             return
@@ -790,10 +862,19 @@ class EditorWindow(tk.Tk):
         if has_document and self.document is not None and self._selected_node_id is not None:
             node = self.document.nodes_by_id.get(self._selected_node_id)
         can_rename = node is not None and node.kind == "definition"
-        state = tk.NORMAL if can_rename else tk.DISABLED
-        self.edit_menu.entryconfigure("Rename Definition…", state=state)
+        rename_state = tk.NORMAL if can_rename else tk.DISABLED
+        self.edit_menu.entryconfigure("Rename Definition…", state=rename_state)
+        can_edit_values = (
+            has_document
+            and self.document is not None
+            and node is not None
+            and numeric_tuple(self.document, node.node_id) is not None
+        )
+        values_state = tk.NORMAL if can_edit_values else tk.DISABLED
+        self.edit_menu.entryconfigure("Edit Values…", state=values_state)
         if hasattr(self, "tree_menu"):
-            self.tree_menu.entryconfigure("Rename Definition…", state=state)
+            self.tree_menu.entryconfigure("Rename Definition…", state=rename_state)
+            self.tree_menu.entryconfigure("Edit Values…", state=values_state)
 
     def _update_title(self) -> None:
         title = "ICR2 3D Document Inspector"

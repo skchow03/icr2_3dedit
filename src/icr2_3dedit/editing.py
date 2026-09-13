@@ -10,6 +10,7 @@ from .document import atomic_write
 from .serializer import ThreeDSerializer, ThreeDSourceEdit
 from .syntax import RESERVED_WORDS, TokenKind, tokenize
 from .threedfile import ThreeDFile
+from .values import numeric_tuple, validate_numeric_literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,33 @@ class ThreeDEditSession:
         if len(renamed) != 1:
             raise RuntimeError("renamed definition did not reparse uniquely")
         return renamed[0]
+
+    def edit_numeric_tuple(self, node_id: int, values: Iterable[str]) -> int:
+        """Edit a coordinate/texcoord by replacing only its number tokens.
+
+        All changed components are committed as one undoable transaction.  The
+        returned NodeID belongs to the freshly parsed document.
+        """
+        editable = numeric_tuple(self.document, node_id)
+        if editable is None:
+            raise ValueError("node_id must identify a valid coordinate or texcoord")
+        replacements = tuple(values)
+        if len(replacements) != len(editable.components):
+            raise ValueError(
+                f"{editable.kind} requires {len(editable.components)} values"
+            )
+        for replacement in replacements:
+            validate_numeric_literal(replacement)
+        edits = tuple(
+            ThreeDSourceEdit(component.start, component.end, replacement)
+            for component, replacement in zip(editable.components, replacements)
+            if replacement != component.spelling
+        )
+        self.execute(f"Edit {editable.kind} values", edits)
+        reparsed = numeric_tuple(self.document, node_id)
+        if reparsed is None:
+            raise RuntimeError("edited numeric tuple did not reparse at its source location")
+        return reparsed.node_id
 
     def save(self, path: str | Path | None = None) -> Path:
         destination = Path(path) if path is not None else self.document.path
