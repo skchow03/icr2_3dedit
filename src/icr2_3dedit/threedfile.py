@@ -159,6 +159,15 @@ class _Builder:
                 gid,_=stack.pop(); g=self.nodes[gid]; g.end=tok.end; g.token_end=i+1; g.closer=tok.text
                 if g.parent_id is not None and self.nodes[g.parent_id].kind=="command":
                     c=self.nodes[g.parent_id]; c.end=tok.end; c.token_end=i+1
+                    # LIST and POLY end with their item group.  Do not let a
+                    # completed nested command claim later siblings in its
+                    # containing source group.
+                    final_group = (
+                        (c.command=="LIST" and g.kind=="list-items")
+                        or (c.command=="POLY" and g.kind=="poly-items")
+                    )
+                    if final_group and active_command==c.node_id:
+                        active_command=None
                 continue
             if active_command is not None and (not stack or stack[-1][0]==self.nodes[active_command].parent_id):
                 c=self.nodes[active_command]; c.end=tok.end; c.token_end=i+1
@@ -211,11 +220,12 @@ class _Builder:
                 tok=self.tokens[i]
                 if tok.kind is not TokenKind.IDENTIFIER: continue
                 upper=tok.text.upper()
-                if upper in COMMANDS or upper in KEYWORDS or upper in RECORD_FIELDS: continue
+                if upper in COMMANDS or upper in KEYWORDS: continue
                 prev=self.tokens[sig[pos-1]] if pos else None; nxt=self.tokens[sig[pos+1]] if pos+1<len(sig) else None
+                parent=self.owner_by_token.get(i,did)
+                if upper in RECORD_FIELDS and self.nodes[parent].kind=="record": continue
                 if prev is not None and prev.kind is TokenKind.DOT: continue
                 if nxt is not None and nxt.kind is TokenKind.EQUALS: continue
-                parent=self.owner_by_token.get(i,did)
                 rid=self._new("reference",tok.start,tok.end,parent,i,i+1,name=tok.text)
                 targets=self.symbols.get(tok.text,[]); target=targets[0] if len(targets)==1 else None; ambiguous=len(targets)>1
                 self.refs.append(ThreeDReference(rid,tok.text,tok.start,tok.end,target,ambiguous))
